@@ -1,0 +1,12 @@
+/bin/*
+!/bin/.gitkeep
+.build
+.idea
+cert
+data
+**/*.log
+.DS_Store
+
+**/*.syso
+node_modules
+*.db

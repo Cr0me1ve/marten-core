@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package hello;
+option go_package = "github.com/Cr0me1ve/marten-core/v2/hello";
+option java_package = "app.marten.core.api.v2.hello";
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloResponse {
+  string message = 1;
+}

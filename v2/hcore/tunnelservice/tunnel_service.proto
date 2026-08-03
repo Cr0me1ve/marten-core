@@ -1,0 +1,14 @@
+syntax = "proto3";
+import "v2/hcommon/common.proto";
+package tunnelservice;
+
+option go_package = "github.com/Cr0me1ve/marten-core/v2/hcore/tunnelservice";
+option java_package = "app.marten.core.api.v2.hcore.tunnelservice";
+import "v2/hcore/tunnelservice/tunnel.proto";
+
+service TunnelService {
+    rpc Start(TunnelStartRequest) returns (TunnelResponse);
+    rpc Stop(hcommon.Empty) returns (TunnelResponse);
+    rpc Status(hcommon.Empty) returns (TunnelResponse);
+    rpc Exit(hcommon.Empty) returns (TunnelResponse);
+}

@@ -1,0 +1,20 @@
+package cmd
+
+import (
+	_ "github.com/Cr0me1ve/marten-core/extension/repository"
+	"github.com/Cr0me1ve/marten-core/extension/server"
+	"github.com/spf13/cobra"
+)
+
+var commandExtension = &cobra.Command{
+	Use:   "extension",
+	Short: "extension configuration",
+	Args:  cobra.MaximumNArgs(0),
+	Run: func(cmd *cobra.Command, args []string) {
+		server.StartTestExtensionServer()
+	},
+}
+
+func init() {
+	mainCommand.AddCommand(commandExtension)
+}
