@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -128,5 +129,46 @@ func TestParseConfigContent_VLESSURIErrorDoesNotFallbackToRay2Sing(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "invalid xhttp extra") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestParseConfigContent_Base64SingleVLESSProducesSelectableTag(t *testing.T) {
+	raw := "vless://00000000-1111-2222-3333-444455556666@example.com:443" +
+		"?security=tls&sni=example.server&fp=chrome&alpn=h2#Germany"
+	encoded := base64.StdEncoding.EncodeToString([]byte(raw))
+
+	options, err := ParseConfigContentToOptions(encoded, false, DefaultMartenOptions(), false)
+	if err != nil {
+		t.Fatalf("ParseConfigContentToOptions returned error: %v", err)
+	}
+	if len(options.Outbounds) != 1 {
+		t.Fatalf("outbounds len = %d, want 1", len(options.Outbounds))
+	}
+	if options.Outbounds[0].Type != C.TypeVLESS {
+		t.Fatalf("outbound type = %q, want vless", options.Outbounds[0].Type)
+	}
+	if options.Outbounds[0].Tag != "Germany § 0" {
+		t.Fatalf("outbound tag = %q, want Germany § 0", options.Outbounds[0].Tag)
+	}
+
+	built, err := BuildConfig(*DefaultMartenOptions(), *options)
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+
+	var selectorFound bool
+	for _, out := range built.Outbounds {
+		if out.Tag == OutboundSelectTag {
+			if len(out.SelectorOptions.Outbounds) != 1 || out.SelectorOptions.Outbounds[0] != options.Outbounds[0].Tag {
+				t.Fatalf("selector outbounds = %#v, want [%q]", out.SelectorOptions.Outbounds, options.Outbounds[0].Tag)
+			}
+			selectorFound = true
+		}
+		if out.Type == C.TypeURLTest {
+			t.Fatalf("unexpected urltest group for single outbound content")
+		}
+	}
+	if !selectorFound {
+		t.Fatal("selector outbound not found")
 	}
 }

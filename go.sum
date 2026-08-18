@@ -7,12 +7,12 @@ github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c h1:0cB1UoFP+vGtqo1sP
 github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
-github.com/Cr0me1ve/TURNcoat v0.0.0-20260725105042-7e0800134a97 h1:4JHBzCzl39I0kVezuqc/2wAMFbrVMFs5NEYrHWv7AQE=
-github.com/Cr0me1ve/TURNcoat v0.0.0-20260725105042-7e0800134a97/go.mod h1:Hl+AT/vSgYBXRy4SrALiRMoI5iUW9wSyvKTZGhu3LKo=
+github.com/Cr0me1ve/TURNcoat v0.0.0-20260817163332-29ba26b97c3c h1:PC1b5+5JUwNijWGOo/y35fuOfifQQ63wz3Pdnl/EGoE=
+github.com/Cr0me1ve/TURNcoat v0.0.0-20260817163332-29ba26b97c3c/go.mod h1:Hl+AT/vSgYBXRy4SrALiRMoI5iUW9wSyvKTZGhu3LKo=
 github.com/Cr0me1ve/marten-icmp v0.1.0-rc.4.0.20260730091006-b2750476ab0c h1:wCO5xTqJEF0UDbHwBxKX/Of7U+L0GOeULJ7Dup+5UK8=
 github.com/Cr0me1ve/marten-icmp v0.1.0-rc.4.0.20260730091006-b2750476ab0c/go.mod h1:Xwcsci5KVmOTK6KAppzdnWXnPl0u3ej9D63hMUosAOU=
-github.com/Cr0me1ve/marten-sing-box v0.0.0-20260730092352-fb1b6e6a8204 h1:GenSpVU6Xj/whJdTHgN1wg8NwNb+B3sPw8BfnBKDjww=
-github.com/Cr0me1ve/marten-sing-box v0.0.0-20260730092352-fb1b6e6a8204/go.mod h1:YiJPzueRC9OSfBmvoq5pbZH5X32f32e+ALuiJum8sdA=
+github.com/Cr0me1ve/marten-sing-box v0.0.0-20260818021617-c18a7ec12ab1 h1:oZg7zlRNZqVUoZwnqRco3FvWliBP0Xjf1zbPC1lgiig=
+github.com/Cr0me1ve/marten-sing-box v0.0.0-20260818021617-c18a7ec12ab1/go.mod h1:Db6Lc1fhw/v1RhyHGRX4aMOO7nKiOuzXXSXIgbGdTeY=
 github.com/DataDog/zstd v1.4.1 h1:3oxKN3wbHibqx897utPC2LTQU4J+IHWWJO+glkAkpFM=
 github.com/DataDog/zstd v1.4.1/go.mod h1:1jcaCB/ufaK+sKp1NBhlGmpz41jOoPQ35bpF36t7BBo=
 github.com/Knetic/govaluate v3.0.1-0.20171022003610-9aa49832a739+incompatible/go.mod h1:r7JcOSlj0wfOMncg0iLm8Leh48TZaKVeNIfJntJ2wa0=

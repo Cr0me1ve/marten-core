@@ -101,6 +101,14 @@ func ResetNetwork() error {
 	return hcore.ResetNetwork()
 }
 
+// ResetNetworkForRouteRecovery performs an in-place transport recovery after
+// the Android VPN data-plane proof has failed. The core service and TUN remain
+// alive; TURNcoat receives a forced physical-carrier retirement instead of a
+// relay-only probe-and-keep decision.
+func ResetNetworkForRouteRecovery() error {
+	return hcore.ResetNetworkForRouteRecovery()
+}
+
 func GetServerPublicKey() []byte {
 	return hcore.GetGrpcServerPublicKey()
 }

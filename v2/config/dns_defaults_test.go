@@ -2,6 +2,7 @@ package config
 
 import (
 	"net/netip"
+	"net/url"
 	"testing"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -9,11 +10,31 @@ import (
 	dns "github.com/sagernet/sing-dns"
 )
 
-func TestDefaultRemoteDNSUsesNativeUDP(t *testing.T) {
-	opt := DefaultMartenOptions()
-	if opt.RemoteDnsAddress != "8.8.8.8" {
-		t.Fatalf("RemoteDnsAddress = %q, want native DNS default", opt.RemoteDnsAddress)
+func TestDefaultRemoteDNSUsesIPLiteralDoHWithoutResolverBootstrap(t *testing.T) {
+	opt := *DefaultMartenOptions()
+	out, err := BuildConfig(opt, option.Options{
+		Outbounds: []option.Outbound{{Type: C.TypeVLESS, Tag: "vless"}},
+	})
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
 	}
+	for _, server := range out.DNS.Servers {
+		if server.Tag != DNSRemoteTag {
+			continue
+		}
+		if server.Address != "https://8.8.8.8/dns-query" {
+			t.Fatalf("default dns-remote address = %q, want IP-literal DoH", server.Address)
+		}
+		parsed, err := url.Parse(server.Address)
+		if err != nil {
+			t.Fatalf("parse default dns-remote address: %v", err)
+		}
+		if host := parsed.Hostname(); host != "8.8.8.8" {
+			t.Fatalf("default dns-remote hostname = %q, want IP literal to avoid bootstrap DNS", host)
+		}
+		return
+	}
+	t.Fatal("dns-remote server not found")
 }
 
 // TestForceTcpDnsForRemote covers the rewrite that prevents sing-box DNS from
@@ -26,16 +47,20 @@ func TestForceTcpDnsForRemote(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"9.9.9.9", "https://dns.quad9.net/dns-query"},
-		{"8.8.8.8", "https://dns.google/dns-query"},
-		{"8.8.8.8:53", "https://dns.google/dns-query"},
-		{"udp://9.9.9.9", "https://dns.quad9.net/dns-query"},
-		{"udp://9.9.9.9:53", "https://dns.quad9.net/dns-query"},
+		{"9.9.9.9", "https://9.9.9.9/dns-query"},
+		{"8.8.8.8", "https://8.8.8.8/dns-query"},
+		{"8.8.8.8:53", "https://8.8.8.8/dns-query"},
+		{"1.1.1.1", "https://1.1.1.1/dns-query"},
+		{"udp://9.9.9.9", "https://9.9.9.9/dns-query"},
+		{"udp://9.9.9.9:53", "https://9.9.9.9/dns-query"},
 		{"203.0.113.8", "tcp://203.0.113.8"},
 		{"udp://203.0.113.8:53", "tcp://203.0.113.8:53"},
 		{"tcp://9.9.9.9", "tcp://9.9.9.9"},
 		{"tls://9.9.9.9", "tls://9.9.9.9"},
+		// Explicit transports belong to the imported config and must not be
+		// rewritten, even if their host is a name rather than an IP literal.
 		{"https://dns.quad9.net/dns-query", "https://dns.quad9.net/dns-query"},
+		{"https://8.8.8.8/dns-query", "https://8.8.8.8/dns-query"},
 		{"h3://9.9.9.9/dns-query", "h3://9.9.9.9/dns-query"},
 		{"quic://9.9.9.9", "quic://9.9.9.9"},
 		{"rcode://success", "rcode://success"},
@@ -80,7 +105,7 @@ func TestRemoteDNSKeepsTCPForTCPOnlyOrMixedProfiles(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := remoteDnsAddressForOutbounds("8.8.8.8", c.outbounds)
-		if got != "https://dns.google/dns-query" {
+		if got != "https://8.8.8.8/dns-query" {
 			t.Fatalf("%s: remote DNS address = %q, want forced DoH", c.name, got)
 		}
 	}

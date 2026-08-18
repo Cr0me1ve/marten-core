@@ -141,3 +141,17 @@ func (h *MobilePlatformInterface) SendNotification(notification *libbox.Notifica
 	}
 	return h.platform.SendNotification(notification)
 }
+
+func (h *MobilePlatformInterface) LoadTurncoatCredential(storageKey string) (string, error) {
+	if h.platform == nil {
+		return "", nil
+	}
+	return h.platform.LoadTurncoatCredential(storageKey)
+}
+
+func (h *MobilePlatformInterface) CompareAndSwapTurncoatCredential(storageKey string, expected string, replacement string) (bool, error) {
+	if h.platform == nil {
+		return false, nil
+	}
+	return h.platform.CompareAndSwapTurncoatCredential(storageKey, expected, replacement)
+}

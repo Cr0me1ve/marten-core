@@ -23,26 +23,51 @@ func Log(level LogLevel, typ LogType, message ...any) {
 		os.Stderr.WriteString(fmt.Sprintf("%v %v %v\n", level, typ, fmt.Sprint(message...)))
 	}
 
-	static.logObserver.Emit(&LogMessage{
+	static.logObserver.Emit(newLogMessage(level, typ, fmt.Sprint(message...)))
+}
+
+func newLogMessage(level LogLevel, typ LogType, message string) *LogMessage {
+	return &LogMessage{
 		Level:   level,
 		Type:    typ,
 		Time:    timestamppb.New(time.Now()),
-		Message: fmt.Sprint(message...),
-	})
+		Message: message,
+	}
 }
 
 func (s *CoreService) LogListener(req *hcommon.Empty, stream grpc.ServerStreamingServer[LogMessage]) error {
 	logSub, stopch, _ := static.logObserver.Subscribe()
 	defer static.logObserver.UnSubscribe(logSub)
+	captchaCursor, pendingCaptcha := subscribeTurncoatCaptchaDelivery()
+	if pendingCaptcha != nil {
+		if err := stream.Send(pendingCaptcha); err != nil {
+			return err
+		}
+	}
 
 	for {
+		captchaEvents, nextCursor, captchaWake := turncoatCaptchaEventsAfter(captchaCursor)
+		for _, info := range captchaEvents {
+			if err := stream.Send(info); err != nil {
+				return err
+			}
+		}
+		captchaCursor = nextCursor
+
 		select {
 		case <-stream.Context().Done():
 			return nil
 		case <-stopch:
 			return nil
-		case info := <-logSub:
-			stream.Send(info)
+		case <-captchaWake:
+			continue
+		case info, ok := <-logSub:
+			if !ok {
+				return nil
+			}
+			if err := stream.Send(info); err != nil {
+				return err
+			}
 			// case <-time.After(500 * time.Millisecond):
 		}
 	}

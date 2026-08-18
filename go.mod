@@ -2,6 +2,8 @@ module github.com/Cr0me1ve/marten-core
 
 go 1.25.5
 
+toolchain go1.26.5
+
 require (
 	github.com/improbable-eng/grpc-web v0.15.0
 	github.com/jellydator/validation v1.1.0
@@ -35,7 +37,7 @@ require (
 	github.com/bogdanfinn/tls-client v1.14.0 // indirect
 	github.com/bogdanfinn/utls v1.7.7-barnius // indirect
 	github.com/bschaatsbergen/dnsdialer v0.0.0-20251225104348-3e7610e8ea45 // indirect
-	github.com/cacggghp/turncoat v0.0.0-20260725105042-7e0800134a97 // indirect
+	github.com/cacggghp/turncoat v0.0.0-20260813002210-2d90c84a9b31 // indirect
 	github.com/cbeuw/connutil v1.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash v1.1.0 // indirect
@@ -175,11 +177,11 @@ require (
 )
 
 // Point sing-box at the local Marten fork used by this workspace.
-replace github.com/sagernet/sing-box => github.com/Cr0me1ve/marten-sing-box v0.0.0-20260730092352-fb1b6e6a8204
+replace github.com/sagernet/sing-box => github.com/Cr0me1ve/marten-sing-box v0.0.0-20260818021617-c18a7ec12ab1
 
 // Marten: TURNcoat dialer (DTLS over TURN). The main-module replace must be
 // present here (replaces in dep modules are ignored).
-replace github.com/cacggghp/turncoat => github.com/Cr0me1ve/TURNcoat v0.0.0-20260725105042-7e0800134a97
+replace github.com/cacggghp/turncoat => github.com/Cr0me1ve/TURNcoat v0.0.0-20260817163332-29ba26b97c3c
 
 // Marten: pin bogdanfinn/tls-client to v1.10.0 — last release without
 // HTTP/3 client (no quic-go-utls dep, no qpack v0.6.0 conflict). Pin

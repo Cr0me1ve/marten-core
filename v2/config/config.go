@@ -415,9 +415,10 @@ func setInbound(options *option.Options, opt *MartenOptions) {
 // `dns-remote` server, which routes through the active tunnel. Bare IPs and
 // `udp://` addresses are rewritten to a TCP-capable transport because some
 // backends (notably VLESS Vision and the TURNcoat helper) can only carry TCP
-// traffic. Known public resolver defaults use DoH on port 443; other addresses
-// fall back to DNS-over-TCP. Already TCP-capable schemes (tcp, tls, https, h3,
-// quic) are passed through.
+// traffic. Known public resolver defaults use IP-literal DoH on port 443 so
+// tunnel DNS bootstrap does not depend on a direct resolver that a restricted
+// network may block. Other addresses fall back to DNS-over-TCP. Already
+// TCP-capable schemes (tcp, tls, https, h3, quic) are passed through.
 //
 // "local" stays untouched — it represents the system resolver, not a real DNS
 // transport, and is only used for the DNSLocalTag server (which uses a direct
@@ -447,11 +448,11 @@ func knownDoHResolverForAddress(address string) string {
 	host = strings.Trim(host, "[]")
 	switch host {
 	case "8.8.8.8", "8.8.4.4":
-		return "https://dns.google/dns-query"
+		return "https://8.8.8.8/dns-query"
 	case "1.1.1.1", "1.0.0.1":
-		return "https://cloudflare-dns.com/dns-query"
+		return "https://1.1.1.1/dns-query"
 	case "9.9.9.9", "149.112.112.112":
-		return "https://dns.quad9.net/dns-query"
+		return "https://9.9.9.9/dns-query"
 	default:
 		return ""
 	}
