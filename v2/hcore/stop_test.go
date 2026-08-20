@@ -254,3 +254,183 @@ func TestCoreStopCoordinatorWaitsAndTimesOut(t *testing.T) {
 	}
 	<-finished
 }
+
+func TestCoreStopCoordinatorFollowerTimesOutWithoutStartingSecondStop(t *testing.T) {
+	var coordinator coreStopCoordinator
+	var stopCalls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	leader := make(chan struct{})
+	go func() {
+		defer close(leader)
+		_, _ = coordinator.runWithTimeout(func() (*CoreInfoResponse, error) {
+			stopCalls.Add(1)
+			close(entered)
+			<-release
+			return &CoreInfoResponse{CoreState: CoreStates_STOPPED}, nil
+		}, time.Second)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("leader stop did not begin")
+	}
+
+	startedAt := time.Now()
+	response, err := coordinator.runWithTimeout(func() (*CoreInfoResponse, error) {
+		stopCalls.Add(1)
+		return nil, errors.New("follower must not start a second stop")
+	}, 10*time.Millisecond)
+	if response != nil {
+		t.Fatalf("timed-out follower response = %#v, want nil", response)
+	}
+	if err == nil || !strings.Contains(err.Error(), "did not finish") {
+		t.Fatalf("timed-out follower error = %v, want bounded in-flight stop timeout", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("follower waited too long: %s", elapsed)
+	}
+	if got := stopCalls.Load(); got != 1 {
+		t.Fatalf("stop actions after timed-out follower = %d, want exactly 1", got)
+	}
+
+	close(release)
+	select {
+	case <-leader:
+	case <-time.After(time.Second):
+		t.Fatal("leader stop did not finish after release")
+	}
+}
+
+func TestCoreStopCoordinatorExactFollowerWaitsPastLeaderBoundedTimeout(t *testing.T) {
+	var coordinator coreStopCoordinator
+	var stopCalls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	wantResponse := &CoreInfoResponse{CoreState: CoreStates_STOPPED}
+	wantErr := errors.New("leader close result")
+	type stopResult struct {
+		response *CoreInfoResponse
+		err      error
+	}
+
+	leaderResult := make(chan stopResult, 1)
+	go func() {
+		response, err := coordinator.runWithTimeout(func() (*CoreInfoResponse, error) {
+			stopCalls.Add(1)
+			close(entered)
+			<-release
+			return wantResponse, wantErr
+		}, 10*time.Millisecond)
+		leaderResult <- stopResult{response: response, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("leader stop did not begin")
+	}
+	select {
+	case result := <-leaderResult:
+		if result.response != nil || result.err == nil || !strings.Contains(result.err.Error(), "did not finish") {
+			t.Fatalf("bounded leader result = (%#v, %v), want (nil, timeout)", result.response, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader did not return at its bounded timeout")
+	}
+
+	exactStarted := make(chan struct{})
+	exactResult := make(chan stopResult, 1)
+	go func() {
+		close(exactStarted)
+		response, err := coordinator.runExact(func() (*CoreInfoResponse, error) {
+			stopCalls.Add(1)
+			return nil, errors.New("exact follower must not start another stop")
+		})
+		exactResult <- stopResult{response: response, err: err}
+	}()
+	<-exactStarted
+	select {
+	case result := <-exactResult:
+		t.Fatalf("exact follower returned before leader release: %#v", result)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	if got := stopCalls.Load(); got != 1 {
+		t.Fatalf("stop callbacks before leader release = %d, want exactly 1", got)
+	}
+	close(release)
+
+	select {
+	case result := <-exactResult:
+		if result.response != wantResponse || !errors.Is(result.err, wantErr) {
+			t.Fatalf("exact follower result = (%#v, %v), want shared (%#v, %v)", result.response, result.err, wantResponse, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exact follower did not finish after leader release")
+	}
+	if got := stopCalls.Load(); got != 1 {
+		t.Fatalf("stop callbacks after exact join = %d, want exactly 1", got)
+	}
+}
+
+func TestBoxCloseCoordinatorExactJoinWaitsPastBoundedCallerTimeout(t *testing.T) {
+	var coordinator boxCloseCoordinator
+	box := new(libbox.BoxService)
+	var closeCalls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	wantErr := errors.New("original Box.Close result")
+
+	boundedResult := make(chan error, 1)
+	go func() {
+		boundedResult <- coordinator.closeWithAction(box, "bounded", 10*time.Millisecond, func() error {
+			closeCalls.Add(1)
+			close(entered)
+			<-release
+			return wantErr
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("bounded Box.Close action did not begin")
+	}
+	select {
+	case err := <-boundedResult:
+		if err == nil || !strings.Contains(err.Error(), "did not finish") {
+			t.Fatalf("bounded Box.Close result = %v, want timeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded Box.Close caller did not return at timeout")
+	}
+
+	exactResult := make(chan error, 1)
+	go func() {
+		exactResult <- coordinator.closeExactWithAction(box, func() error {
+			closeCalls.Add(1)
+			return errors.New("exact join must not start another action")
+		})
+	}()
+	select {
+	case err := <-exactResult:
+		t.Fatalf("exact Box.Close join returned before original action released: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if got := closeCalls.Load(); got != 1 {
+		t.Fatalf("Box.Close actions before release = %d, want exactly 1", got)
+	}
+
+	close(release)
+	select {
+	case err := <-exactResult:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("exact Box.Close result = %v, want shared %v", err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exact Box.Close join did not return after original action released")
+	}
+	if got := closeCalls.Load(); got != 1 {
+		t.Fatalf("Box.Close actions after exact join = %d, want exactly 1", got)
+	}
+}

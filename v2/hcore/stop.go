@@ -30,27 +30,67 @@ type coreStopCoordinator struct {
 	operation *coreStopOperation
 }
 
+func (coordinator *coreStopCoordinator) currentOrStart(
+	stop func() (*CoreInfoResponse, error),
+) (*coreStopOperation, bool) {
+	coordinator.lock.Lock()
+	defer coordinator.lock.Unlock()
+	if operation := coordinator.operation; operation != nil {
+		return operation, false
+	}
+
+	operation := &coreStopOperation{done: make(chan struct{})}
+	coordinator.operation = operation
+	go func() {
+		operation.response, operation.err = stop()
+		coordinator.lock.Lock()
+		if coordinator.operation == operation {
+			coordinator.operation = nil
+		}
+		close(operation.done)
+		coordinator.lock.Unlock()
+	}()
+	return operation, true
+}
+
 func (coordinator *coreStopCoordinator) run(
 	stop func() (*CoreInfoResponse, error),
 ) (*CoreInfoResponse, error) {
-	coordinator.lock.Lock()
-	if operation := coordinator.operation; operation != nil {
-		coordinator.lock.Unlock()
-		Log(LogLevel_DEBUG, LogType_CORE, "joining in-flight core stop")
-		<-operation.done
-		return operation.response, operation.err
-	}
-	operation := &coreStopOperation{done: make(chan struct{})}
-	coordinator.operation = operation
-	coordinator.lock.Unlock()
+	return coordinator.runWithTimeout(stop, stopCloseGracePeriod)
+}
 
-	operation.response, operation.err = stop()
-	coordinator.lock.Lock()
-	if coordinator.operation == operation {
-		coordinator.operation = nil
+func (coordinator *coreStopCoordinator) runWithTimeout(
+	stop func() (*CoreInfoResponse, error),
+	timeout time.Duration,
+) (*CoreInfoResponse, error) {
+	operation, started := coordinator.currentOrStart(stop)
+	if !started {
+		Log(LogLevel_DEBUG, LogType_CORE, "joining in-flight core stop")
 	}
-	close(operation.done)
-	coordinator.lock.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-operation.done:
+		return operation.response, operation.err
+	case <-timer.C:
+		err := fmt.Errorf("in-flight core stop did not finish within %s", timeout)
+		Log(LogLevel_WARNING, LogType_CORE, err.Error())
+		return nil, err
+	}
+}
+
+// runExact is reserved for the single process-wide Close operation. Public
+// Stop callers receive a bounded result from runWithTimeout, but Close must
+// keep owning and joining the original stop until it really finishes; returning
+// early would let a later Close start a second teardown for the same Box.
+func (coordinator *coreStopCoordinator) runExact(
+	stop func() (*CoreInfoResponse, error),
+) (*CoreInfoResponse, error) {
+	operation, started := coordinator.currentOrStart(stop)
+	if !started {
+		Log(LogLevel_DEBUG, LogType_CORE, "joining exact in-flight core stop")
+	}
+	<-operation.done
 	return operation.response, operation.err
 }
 
@@ -104,7 +144,35 @@ func (coordinator *boxCloseCoordinator) closeWithAction(
 	gracePeriod time.Duration,
 	closeAction func() error,
 ) error {
+	operation := coordinator.currentOrStart(box, closeAction)
+
+	timer := time.NewTimer(gracePeriod)
+	defer timer.Stop()
+	select {
+	case <-operation.done:
+		return coordinator.result(box, operation)
+	case <-timer.C:
+		err := fmt.Errorf("core close did not finish within %s during %s", gracePeriod, reason)
+		Log(LogLevel_WARNING, LogType_CORE, err.Error())
+		return err
+	}
+}
+
+func (coordinator *boxCloseCoordinator) closeExactWithAction(
+	box *libbox.BoxService,
+	closeAction func() error,
+) error {
+	operation := coordinator.currentOrStart(box, closeAction)
+	<-operation.done
+	return coordinator.result(box, operation)
+}
+
+func (coordinator *boxCloseCoordinator) currentOrStart(
+	box *libbox.BoxService,
+	closeAction func() error,
+) *boxCloseOperation {
 	coordinator.lock.Lock()
+	defer coordinator.lock.Unlock()
 	if coordinator.operations == nil {
 		coordinator.operations = make(map[*libbox.BoxService]*boxCloseOperation)
 	}
@@ -114,28 +182,24 @@ func (coordinator *boxCloseCoordinator) closeWithAction(
 		coordinator.operations[box] = operation
 		go coordinator.run(operation, closeAction)
 	}
-	coordinator.lock.Unlock()
+	return operation
+}
 
-	timer := time.NewTimer(gracePeriod)
-	defer timer.Stop()
-	select {
-	case <-operation.done:
-		coordinator.lock.Lock()
-		err := operation.err
-		// A completed successful close needs no retained registry entry.  A
-		// real close failure remains sticky so a later caller cannot mistake
-		// Box.Close's os.ErrClosed response for completed cleanup while an
-		// internal shutdown goroutine may still own resources.
-		if err == nil && coordinator.operations[box] == operation {
-			delete(coordinator.operations, box)
-		}
-		coordinator.lock.Unlock()
-		return err
-	case <-timer.C:
-		err := fmt.Errorf("core close did not finish within %s during %s", gracePeriod, reason)
-		Log(LogLevel_WARNING, LogType_CORE, err.Error())
-		return err
+func (coordinator *boxCloseCoordinator) result(
+	box *libbox.BoxService,
+	operation *boxCloseOperation,
+) error {
+	coordinator.lock.Lock()
+	defer coordinator.lock.Unlock()
+	err := operation.err
+	// A completed successful close needs no retained registry entry. A real
+	// close failure remains sticky so a later caller cannot mistake Box.Close's
+	// os.ErrClosed response for completed cleanup while native resources may
+	// still be owned by the failed operation.
+	if err == nil && coordinator.operations[box] == operation {
+		delete(coordinator.operations, box)
 	}
+	return err
 }
 
 func (coordinator *boxCloseCoordinator) run(operation *boxCloseOperation, closeAction func() error) {
@@ -195,6 +259,10 @@ func Stop() (coreResponse *CoreInfoResponse, err error) {
 	return stopOperations.run(stopOnce)
 }
 
+func stopForClose() (coreResponse *CoreInfoResponse, err error) {
+	return stopOperations.runExact(stopOnce)
+}
+
 func stopOnce() (coreResponse *CoreInfoResponse, err error) {
 	defer cleanupPlaintextRuntimeConfig()
 	defer config.DeferPanicToError("stop", func(recovered_err error) {
@@ -238,7 +306,10 @@ func stopOnce() (coreResponse *CoreInfoResponse, err error) {
 	SetCoreStatus(CoreStates_STOPPING, MessageType_EMPTY, "")
 	static.lock.Unlock()
 
-	err = closeBoxWithGrace(box, "stop", stopCloseGracePeriod)
+	// The coordinator, not the public caller, owns the exact Box.Close. Public
+	// Stop calls wait only for stopCloseGracePeriod, while Mobile.Close joins
+	// this same operation until the native close action has actually returned.
+	err = closeBoxExact(box)
 	if err != nil {
 		// Preserve the exact instance so a later bounded cleanup or process
 		// teardown still owns every native resource, including the TUN fd.
@@ -274,6 +345,12 @@ func waitForInFlightStart(done <-chan struct{}, timeout time.Duration) error {
 
 func closeBoxWithGrace(box *libbox.BoxService, reason string, gracePeriod time.Duration) error {
 	return boxCloseOperations.close(box, reason, gracePeriod)
+}
+
+func closeBoxExact(box *libbox.BoxService) error {
+	return boxCloseOperations.closeExactWithAction(box, func() error {
+		return common.Close(box)
+	})
 }
 
 func closeWithGrace(closeAction func() error, reason string, gracePeriod time.Duration) error {

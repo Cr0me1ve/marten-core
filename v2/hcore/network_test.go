@@ -1,9 +1,40 @@
 package hcore
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestNetworkResetUsesBoundedDetachedBoxSnapshot(t *testing.T) {
+	source, err := os.ReadFile("network.go")
+	if err != nil {
+		t.Fatalf("read network.go: %v", err)
+	}
+	body := string(source)
+
+	for _, required := range []string{
+		"const networkResetTimeout = 10 * time.Second",
+		"static.lock.Lock()",
+		"box := static.Box",
+		"state := static.CoreState",
+		"static.lock.Unlock()",
+		"resetDone := make(chan error, 1)",
+		"go func() {",
+		"case <-timer.C:",
+		"network reset did not finish within",
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("network reset must contain %q", required)
+		}
+	}
+
+	unlock := strings.Index(body, "static.lock.Unlock()")
+	reset := strings.Index(body, "box.ResetNetwork()")
+	if unlock < 0 || reset < unlock {
+		t.Fatal("network reset must snapshot and unlock static state before invoking Box.ResetNetwork")
+	}
+}
 
 func TestNetworkResetsWhenCoreIsNotStartedReturnTheSameFailClosedError(t *testing.T) {
 	static.lock.Lock()

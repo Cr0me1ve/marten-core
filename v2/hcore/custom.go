@@ -46,7 +46,10 @@ func closeCore(mode SetupMode) (closeErr error) {
 	})
 	log.Debug("[Service] Closing")
 
-	_, err := Stop()
+	// Close is the exact owner of native teardown. A concurrent public Stop may
+	// time out for its caller, but this close operation keeps joining that same
+	// stop so another Close cannot overtake it and touch the same Box twice.
+	_, err := stopForClose()
 	CloseGrpcServer(mode)
 	if isBackgroundSetupMode(mode) {
 		clearCorePlatformInterface()
