@@ -199,7 +199,7 @@ replace github.com/quic-go/qpack => github.com/quic-go/qpack v0.5.1
 // Go ≥1.23 has native net.Interfaces on Android, so anet is a no-op stub anyway.
 replace github.com/wlynxg/anet => github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c
 
-replace github.com/xtls/xray-core => github.com/hiddify/xray-core v0.0.0-20250413171226-57bd02ee2c86
+replace github.com/xtls/xray-core => ../marten-sing-box/third_party/xray-core
 
 replace github.com/sagernet/wireguard-go => github.com/hiddify/wireguard-go v0.0.0-20250427083853-fa9271bf7486
 

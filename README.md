@@ -12,7 +12,7 @@ Marten Core is the Go runtime used by [marten-app](https://github.com/Cr0me1ve/m
 
 ## Tooling
 
-Use the Go version declared in [go.mod](go.mod). This snapshot does not vendor the Marten-specific external modules used for TURNcoat and ICMP support. A full build therefore requires those module sources to be available to Go's module resolver.
+Use the Go version declared in [go.mod](go.mod). Clone [marten-sing-box](https://github.com/Cr0me1ve/marten-sing-box) alongside this checkout; the main module uses its bundled Xray transport changes. This snapshot does not vendor the Marten-specific external modules used for TURNcoat and ICMP support. A full build therefore requires those module sources to be available to Go's module resolver.
 
 ## Verify
 
