@@ -165,7 +165,7 @@ func GetOverridableMartenOptions(overrides map[string][]string) *MartenOptions {
 
 	// Use reflection to iterate over the fields of MartenOptions
 	v := reflect.ValueOf(&overrideMarten).Elem()
-	t := reflect.TypeOf(overrideMarten)
+	t := reflect.TypeOf(&overrideMarten).Elem()
 
 	// Recursively set the fields that are marked as overridable
 	setOverridableFields(v, t, nestedOverrides)

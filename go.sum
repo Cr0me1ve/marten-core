@@ -7,12 +7,12 @@ github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c h1:0cB1UoFP+vGtqo1sP
 github.com/BieHDC/anet v0.0.6-0.20241226223613-d47f8b766b3c/go.mod h1:eay5PRQr7fIVAMbTbchTnO9gG65Hg/uYGdc7mguHxoA=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
-github.com/Cr0me1ve/TURNcoat v0.0.0-20260817163332-29ba26b97c3c h1:PC1b5+5JUwNijWGOo/y35fuOfifQQ63wz3Pdnl/EGoE=
-github.com/Cr0me1ve/TURNcoat v0.0.0-20260817163332-29ba26b97c3c/go.mod h1:Hl+AT/vSgYBXRy4SrALiRMoI5iUW9wSyvKTZGhu3LKo=
+github.com/Cr0me1ve/TURNcoat v0.0.0-20260822152749-1a91d02c9b3c h1:ccS789Yngdc1nKd7ge5L+sMJOT9F2N4ERx2FkthKVhw=
+github.com/Cr0me1ve/TURNcoat v0.0.0-20260822152749-1a91d02c9b3c/go.mod h1:5mFV5F3Dgo3ofCRhukbeIzuYmrZjibpV4z6yTGp4byk=
 github.com/Cr0me1ve/marten-icmp v0.1.0-rc.4.0.20260730091006-b2750476ab0c h1:wCO5xTqJEF0UDbHwBxKX/Of7U+L0GOeULJ7Dup+5UK8=
 github.com/Cr0me1ve/marten-icmp v0.1.0-rc.4.0.20260730091006-b2750476ab0c/go.mod h1:Xwcsci5KVmOTK6KAppzdnWXnPl0u3ej9D63hMUosAOU=
-github.com/Cr0me1ve/marten-sing-box v0.0.0-20260818021617-c18a7ec12ab1 h1:oZg7zlRNZqVUoZwnqRco3FvWliBP0Xjf1zbPC1lgiig=
-github.com/Cr0me1ve/marten-sing-box v0.0.0-20260818021617-c18a7ec12ab1/go.mod h1:Db6Lc1fhw/v1RhyHGRX4aMOO7nKiOuzXXSXIgbGdTeY=
+github.com/Cr0me1ve/marten-sing-box v0.0.0-20261022164405-510ac81818f6 h1:sCul/DJL+iESAJHwGMgcgwlTJpUnzkTuidtKSMNx5PE=
+github.com/Cr0me1ve/marten-sing-box v0.0.0-20261022164405-510ac81818f6/go.mod h1:OrZShOncLP5fWQH/psI8sJj5/5MZAYWiuGgea2IuiFc=
 github.com/DataDog/zstd v1.4.1 h1:3oxKN3wbHibqx897utPC2LTQU4J+IHWWJO+glkAkpFM=
 github.com/DataDog/zstd v1.4.1/go.mod h1:1jcaCB/ufaK+sKp1NBhlGmpz41jOoPQ35bpF36t7BBo=
 github.com/Knetic/govaluate v3.0.1-0.20171022003610-9aa49832a739+incompatible/go.mod h1:r7JcOSlj0wfOMncg0iLm8Leh48TZaKVeNIfJntJ2wa0=
@@ -523,8 +523,6 @@ github.com/sagernet/fswatch v0.1.1 h1:YqID+93B7VRfqIH3PArW/XpJv5H4OLEVWDfProGoRQ
 github.com/sagernet/fswatch v0.1.1/go.mod h1:nz85laH0mkQqJfaOrqPpkwtU1znMFNVTpT/5oRsVz/o=
 github.com/sagernet/gomobile v0.1.12 h1:XwzjZaclFF96deLqwAgK8gU3w0M2A8qxgDmhV+A0wjg=
 github.com/sagernet/gomobile v0.1.12/go.mod h1:A8l3FlHi2D/+mfcd4HHvk5DGFPW/ShFb9jHP5VmSiDY=
-github.com/sagernet/gvisor v0.0.0-20241123041152-536d05261cff h1:mlohw3360Wg1BNGook/UHnISXhUx4Gd/3tVLs5T0nSs=
-github.com/sagernet/gvisor v0.0.0-20241123041152-536d05261cff/go.mod h1:ehZwnT2UpmOWAHFL48XdBhnd4Qu4hN2O3Ji0us3ZHMw=
 github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a h1:ObwtHN2VpqE0ZNjr6sGeT00J8uU7JF4cNUdb44/Duis=
 github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a/go.mod h1:xLnfdiJbSp8rNqYEdIW/6eDO4mVoogml14Bh2hSiFpM=
 github.com/sagernet/nftables v0.3.0-beta.4 h1:kbULlAwAC3jvdGAC1P5Fa3GSxVwQJibNenDW2zaXr8I=
@@ -548,8 +546,6 @@ github.com/sagernet/sing-shadowsocks2 v0.2.0 h1:wpZNs6wKnR7mh1wV9OHwOyUr21VkS3wK
 github.com/sagernet/sing-shadowsocks2 v0.2.0/go.mod h1:RnXS0lExcDAovvDeniJ4IKa2IuChrdipolPYWBv9hWQ=
 github.com/sagernet/sing-shadowtls v0.1.5 h1:uXxmq/HXh8DIiBGLzpMjCbWnzIAFs+lIxiTOjdgG5qo=
 github.com/sagernet/sing-shadowtls v0.1.5/go.mod h1:tvrDPTGLrSM46Wnf7mSr+L8NHvgvF8M4YnJF790rZX4=
-github.com/sagernet/sing-tun v0.4.5 h1:GgZR9pNRem0TigZw1AgdrCE/v2oRexjmyAytvp89kW0=
-github.com/sagernet/sing-tun v0.4.5/go.mod h1:1WQVMelJQjrtlzhzHwwPTSa7n41b3zSWP2DeJqWxruk=
 github.com/sagernet/sing-vmess v0.1.13 h1:/GSfD1Rt6/mVfE80WFHNBykNT7KJNWWmvcMP9DoElEs=
 github.com/sagernet/sing-vmess v0.1.13/go.mod h1:D+g+lhv4iOk1Pn08pd3MtUd72khL5+wgEE3xVH8J+ow=
 github.com/sagernet/smux v0.0.0-20231208180855-7041f6ea79e7 h1:DImB4lELfQhplLTxeq2z31Fpv8CQqqrUwTbrIRumZqQ=

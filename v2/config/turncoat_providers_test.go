@@ -1,12 +1,57 @@
 package config
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 )
+
+func TestParseConfigContentSalvagesCompatibleProvidersIndependently(t *testing.T) {
+	const sub = `{
+		"providers": [
+			{"hosts":[" provider.example.test "],"credentials":[{"client_id":"placeholder-id","client_secret":"placeholder-secret","future_credential_field":true}],"future_provider_field":{"revision":2}},
+			{"hosts":"wrong-type","credentials":[{"client_id":"placeholder-id","client_secret":"placeholder-secret"}]},
+			{"hosts":[""],"credentials":[{"client_id":"placeholder-id","client_secret":"placeholder-secret"}]},
+			{"hosts":["empty-credentials.example.test"],"credentials":[{"client_id":"","client_secret":"placeholder-secret"}]}
+		],
+		"outbounds": [
+			{"type":"future-protocol","tag":"future"},
+			{"type":"vless","tag":"usable","server":"usable.example.test","server_port":443,"uuid":"00000000-0000-0000-0000-000000000001","future_outbound_field":true},
+			{"type":"vless","tag":"malformed","server":"malformed.example.test","server_port":443}
+		]
+	}`
+
+	canonical, err := ParseConfigContent(sub, false, DefaultMartenOptions(), false)
+	if err != nil {
+		t.Fatalf("mixed subscription must keep compatible providers and selectable outbounds: %v", err)
+	}
+
+	var decoded struct {
+		Providers []struct {
+			Hosts       []string `json:"hosts"`
+			Credentials []struct {
+				ClientID     string `json:"client_id"`
+				ClientSecret string `json:"client_secret"`
+			} `json:"credentials"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(canonical, &decoded); err != nil {
+		t.Fatalf("decode canonical config: %v", err)
+	}
+	if len(decoded.Providers) != 1 {
+		t.Fatalf("want exactly one surviving provider, got %#v", decoded.Providers)
+	}
+	provider := decoded.Providers[0]
+	if len(provider.Hosts) != 1 || provider.Hosts[0] != "provider.example.test" {
+		t.Fatalf("provider hosts were not canonicalized: %#v", provider.Hosts)
+	}
+	if len(provider.Credentials) != 1 || provider.Credentials[0].ClientID != "placeholder-id" || provider.Credentials[0].ClientSecret != "placeholder-secret" {
+		t.Fatalf("provider credentials were not retained: %#v", provider.Credentials)
+	}
+}
 
 // TestParser_PreservesTopLevelProviders verifies that a top-level `providers`
 // field in a sing-box subscription survives the non-fullConfig parser pass.

@@ -32,7 +32,7 @@ var martenTopLevelPassThrough = []string{
 }
 
 // martenOutboundUnknownLeakKeys are keys that older or buggy versions of
-// marten-server accidentally merged into per-outbound JSON (server-side
+// subscription providers accidentally merged into per-outbound JSON (server-side
 // bookkeeping for the device credential). sing-box decodes outbound options
 // with DisallowUnknownFields(), so any of these in an outbound aborts the
 // whole config with `unmarshal error: outbounds[N].<key>: unknown field`.
@@ -42,6 +42,74 @@ var martenOutboundUnknownLeakKeys = []string{
 	"credential_id",
 	"device_secret",
 	"credential_expires_at",
+}
+
+// sanitizeMartenSubscriptionProviders canonicalizes the optional shared
+// TURNcoat provider list before option.Options performs its strict recursive
+// decode. Providers are subscription metadata rather than independently
+// selectable routes: a field added by a newer server, or one malformed entry,
+// must not make every otherwise compatible outbound fail validation.
+//
+// encoding/json intentionally ignores fields unknown to this build while
+// still rejecting values whose types cannot be represented by the bundled
+// provider schema. Invalid entries are dropped independently and an empty
+// result removes the optional top-level field altogether.
+func sanitizeMartenSubscriptionProviders(jsonObj map[string]interface{}) bool {
+	rawProviders, exists := jsonObj["providers"]
+	if !exists {
+		return false
+	}
+	providerItems, ok := rawProviders.([]interface{})
+	if !ok {
+		delete(jsonObj, "providers")
+		return true
+	}
+
+	dropped := false
+	providers := make([]option.TurncoatProvider, 0, len(providerItems))
+	for _, rawProvider := range providerItems {
+		content, err := json.Marshal(rawProvider)
+		if err != nil {
+			dropped = true
+			continue
+		}
+		var provider option.TurncoatProvider
+		if err = json.Unmarshal(content, &provider); err != nil {
+			dropped = true
+			continue
+		}
+
+		hosts := make([]string, 0, len(provider.Hosts))
+		for _, host := range provider.Hosts {
+			if normalized := strings.TrimSpace(host); normalized != "" {
+				hosts = append(hosts, normalized)
+			} else {
+				dropped = true
+			}
+		}
+		credentials := make([]option.TurncoatAppCredentials, 0, len(provider.Credentials))
+		for _, credential := range provider.Credentials {
+			if strings.TrimSpace(credential.ClientID) == "" || credential.ClientSecret == "" {
+				dropped = true
+				continue
+			}
+			credentials = append(credentials, credential)
+		}
+		if len(hosts) == 0 || len(credentials) == 0 {
+			dropped = true
+			continue
+		}
+		provider.Hosts = hosts
+		provider.Credentials = credentials
+		providers = append(providers, provider)
+	}
+
+	if len(providers) == 0 {
+		delete(jsonObj, "providers")
+	} else {
+		jsonObj["providers"] = providers
+	}
+	return dropped
 }
 
 // stripMartenOutboundLeakKeys removes known server-side leak keys from each
@@ -669,6 +737,7 @@ func ParseConfigContent(contentstr string, debug bool, configOpt *MartenOptions,
 		stripMartenOutboundLeakKeys(jsonObj)
 		isFullConfig := fullConfig || configOpt.EnableFullConfig
 		if !isFullConfig {
+			sanitizeMartenSubscriptionProviders(jsonObj)
 			if dropped := sanitizeMartenSubscriptionOutbounds(jsonObj); dropped && !hasMartenSelectableOutbound(jsonObj) {
 				return nil, fmt.Errorf("[SingboxParser] no supported selectable outbounds")
 			}

@@ -39,6 +39,11 @@ else
   (cd "$source_goroot" && tar cf - .) | (cd "$tmp_goroot" && tar xf -)
 fi
 
+# Toolchains downloaded by GOTOOLCHAIN are stored in the module cache with
+# read-only source files. The Android CLOCK_BOOTTIME patch needs a private,
+# writable copy regardless of how the selected toolchain was installed.
+chmod -R u+w "$tmp_goroot"
+
 patch_runtime() {
   local file="$1"
   shift

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	runtimeDebug "runtime/debug"
 	"time"
 
@@ -23,6 +24,8 @@ import (
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 	"github.com/sagernet/sing/service/pause"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -38,7 +41,7 @@ func InitMartenService() error {
 }
 
 func (s *CoreService) Setup(ctx context.Context, req *SetupRequest) (*hcommon.Response, error) {
-	err := Setup(req, nil)
+	err := setupWithAdmission(ctx, req, nil, s.grpcOwner)
 	code := hcommon.ResponseCode_OK
 	message := ""
 	if err != nil {
@@ -49,9 +52,60 @@ func (s *CoreService) Setup(ctx context.Context, req *SetupRequest) (*hcommon.Re
 }
 
 func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) error {
-	return coreLifecycle.run(func() error {
-		return setup(params, platformInterface)
-	})
+	return setupWithAdmission(context.Background(), params, platformInterface, nil)
+}
+
+func setupWithAdmission(
+	ctx context.Context,
+	params *SetupRequest,
+	platformInterface libbox.PlatformInterface,
+	owner *grpcServerOwner,
+) error {
+	// Native iOS foreground setup must repair a dead control listener without
+	// stopping the Packet Tunnel (which owns a different process and mode).
+	if owner == nil && (runtime.GOOS == "ios" || runtime.GOOS == "darwin") {
+		if err := repairForegroundGrpcReadiness(ctx, params.Mode, params.Listen); err != nil {
+			return err
+		}
+	}
+	for {
+		ownerCurrent, pendingStops := grpcSetupAdmissionSnapshot(owner)
+		if !ownerCurrent {
+			return status.Error(codes.Unavailable, "gRPC setup server is stopping")
+		}
+
+		// Never wait for server.Stop while holding coreLifecycle. Stop uses
+		// WaitForHandlers(true), and an admitted Setup handler may itself be
+		// one of the handlers that must acquire coreLifecycle to reject its
+		// stale generation and return.
+		for _, operation := range pendingStops {
+			select {
+			case <-operation.done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		retry := false
+		err := coreLifecycle.run(func() error {
+			ownerCurrent, pendingStops = grpcSetupAdmissionSnapshot(owner)
+			if !ownerCurrent {
+				return status.Error(codes.Unavailable, "gRPC setup server is stopping")
+			}
+			if len(pendingStops) != 0 {
+				retry = true
+				return nil
+			}
+			setupErr := setup(params, platformInterface)
+			if setupErr == nil {
+				openStartAdmissionAfterSetup()
+			}
+			return setupErr
+		})
+		if !retry {
+			return err
+		}
+	}
 }
 
 func setup(params *SetupRequest, platformInterface libbox.PlatformInterface) (setupErr error) {
@@ -184,16 +238,14 @@ func setup(params *SetupRequest, platformInterface libbox.PlatformInterface) (se
 	if err := InitMartenService(); err != nil {
 		return E.Cause(err, "initialize core services")
 	}
-	if serverAlreadyStarted {
-		Log(LogLevel_WARNING, LogType_CORE, "grpcServer already started; readiness revalidated")
-		return nil
-	}
-
 	switch params.Mode {
 	case SetupMode_OLD:
 		statusPropagationPort = int64(params.FlutterStatusPort)
 		return nil
 	default:
+		if serverAlreadyStarted {
+			Log(LogLevel_WARNING, LogType_CORE, "grpcServer already started; atomically revalidating readiness")
+		}
 		Log(LogLevel_DEBUG, LogType_CORE, fmt.Sprintf(
 			"core gRPC readiness publishing mode=%s",
 			params.Mode.String(),

@@ -48,6 +48,33 @@ var (
 	PredefinedOutboundTags = []string{OutboundDirectTag, OutboundBypassTag, OutboundBlockTag, OutboundSelectTag, OutboundURLTestTag, OutboundDNSTag, OutboundDirectFragmentTag}
 )
 
+// PlatformEndpointResolver resolves proxy bootstrap hostnames through a
+// platform-selected physical network. Android installs this hook because its
+// UID-default resolver points at the fail-closed VPN as soon as the blocker is
+// established; using net.DefaultResolver there can recursively send the
+// endpoint lookup into the TUN that the endpoint itself is needed to start.
+type PlatformEndpointResolver func(context.Context, string) ([]netip.Addr, error)
+
+var (
+	platformEndpointResolverMu sync.RWMutex
+	platformEndpointResolver   PlatformEndpointResolver
+)
+
+// SetPlatformEndpointResolver replaces the process-wide endpoint bootstrap
+// resolver. Passing nil restores the normal resolver used on non-Android
+// platforms and by standalone core consumers.
+func SetPlatformEndpointResolver(resolver PlatformEndpointResolver) {
+	platformEndpointResolverMu.Lock()
+	platformEndpointResolver = resolver
+	platformEndpointResolverMu.Unlock()
+}
+
+func loadPlatformEndpointResolver() PlatformEndpointResolver {
+	platformEndpointResolverMu.RLock()
+	defer platformEndpointResolverMu.RUnlock()
+	return platformEndpointResolver
+}
+
 func BuildConfigJson(configOpt MartenOptions, input option.Options) (string, error) {
 	options, err := BuildConfig(configOpt, input)
 	if err != nil {
@@ -137,7 +164,7 @@ func setOutbounds(options *option.Options, input *option.Options, opt *MartenOpt
 	var tags []string
 	// Deduplicate by tag. sing-box rejects the whole config with
 	// "outbound tag X duplicated" if two outbounds share a tag, and some
-	// versions of marten-server emit the same outbound twice in a single
+	// subscription providers emit the same outbound twice in a single
 	// subscription. First occurrence wins; later duplicates are silently
 	// dropped so the client still connects.
 	seenTags := map[string]bool{}
@@ -320,6 +347,10 @@ func setLog(options *option.Options, opt *MartenOptions) {
 }
 
 func setInbound(options *option.Options, opt *MartenOptions) {
+	setInboundForPlatform(options, opt, runtime.GOOS)
+}
+
+func setInboundForPlatform(options *option.Options, opt *MartenOptions, goos string) {
 	var inboundDomainStrategy option.DomainStrategy
 	if !opt.ResolveDestination {
 		inboundDomainStrategy = option.DomainStrategy(dns.DomainStrategyAsIS)
@@ -394,6 +425,15 @@ func setInbound(options *option.Options, opt *MartenOptions) {
 		},
 	)
 
+	// Android routes TUN DNS inside sing-box and resolves transport bootstrap
+	// through PlatformEndpointResolver; no stable local DNS socket is part of
+	// the mobile contract. Keep the direct inbound for config compatibility,
+	// but let the kernel assign its private port so an old or foreign owner of
+	// the legacy fixed port cannot block a new VPN generation.
+	localDNSListenPort := opt.LocalDnsPort
+	if goos == "android" {
+		localDNSListenPort = 0
+	}
 	options.Inbounds = append(
 		options.Inbounds,
 		option.Inbound{
@@ -402,7 +442,7 @@ func setInbound(options *option.Options, opt *MartenOptions) {
 			DirectOptions: option.DirectInboundOptions{
 				ListenOptions: option.ListenOptions{
 					Listen:     option.NewListenAddress(netip.MustParseAddr(bind)),
-					ListenPort: opt.LocalDnsPort,
+					ListenPort: localDNSListenPort,
 				},
 				// OverrideAddress: "1.1.1.1",
 				// OverridePort:    53,
@@ -1012,43 +1052,87 @@ var (
 	ipMapsMutex sync.Mutex
 )
 
+func lookupEndpointIPs(ctx context.Context, domain string) []string {
+	if resolver := loadPlatformEndpointResolver(); resolver != nil {
+		addresses, err := resolver(ctx, domain)
+		if err != nil {
+			return nil
+		}
+		resolved := make([]string, 0, len(addresses))
+		for _, address := range addresses {
+			if !address.IsValid() {
+				continue
+			}
+			resolved = append(resolved, address.Unmap().String())
+		}
+		return resolved
+	}
+
+	addresses, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
+	if err != nil {
+		return nil
+	}
+	resolved := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		resolved = append(resolved, address.String())
+	}
+	return resolved
+}
+
+var endpointLookupSlots = make(chan struct{}, 4)
+
 func getIPs(domains ...string) []string {
-	var wg sync.WaitGroup
-	resChan := make(chan string, len(domains)*10) // Collect both IPv4 and IPv6
+	if len(domains) == 0 {
+		return nil
+	}
+	platformResolverRequired := loadPlatformEndpointResolver() != nil
+	resChan := make(chan []string, len(domains))
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	for _, d := range domains {
-		wg.Add(1)
 		go func(domain string) {
-			defer wg.Done()
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
-			if err != nil {
+			select {
+			case endpointLookupSlots <- struct{}{}:
+				defer func() { <-endpointLookupSlots }()
+			case <-ctx.Done():
 				return
 			}
-			for _, ip := range ips {
-				ipStr := ip.String()
-				if !isBlockedIP(ipStr) {
-					resChan <- ipStr
-				}
+			ips := lookupEndpointIPs(ctx, domain)
+			select {
+			case resChan <- ips:
+			case <-ctx.Done():
 			}
 		}(d)
 	}
-
-	go func() {
-		wg.Wait()
-		close(resChan)
-	}()
-
 	var res []string
-	for ip := range resChan {
-		res = append(res, ip)
+collect:
+	for remaining := len(domains); remaining > 0; remaining-- {
+		select {
+		case ips := <-resChan:
+			for _, ip := range ips {
+				if !isBlockedIP(ip) {
+					res = append(res, ip)
+				}
+			}
+		case <-ctx.Done():
+			break collect
+		}
 	}
-	if len(res) == 0 && ipMaps[domains[0]] != nil {
-		return ipMaps[domains[0]]
+	if len(res) == 0 {
+		// Android's physical resolver is authoritative while installed. A
+		// previous network's process cache must not revive an endpoint that the
+		// current physical Network could not resolve.
+		if platformResolverRequired {
+			return nil
+		}
+		ipMapsMutex.Lock()
+		cached := append([]string(nil), ipMaps[domains[0]]...)
+		ipMapsMutex.Unlock()
+		return cached
 	}
 	ipMapsMutex.Lock()
-	ipMaps[domains[0]] = res
+	ipMaps[domains[0]] = append([]string(nil), res...)
 	ipMapsMutex.Unlock()
 
 	return res

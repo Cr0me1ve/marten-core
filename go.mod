@@ -1,8 +1,6 @@
 module github.com/Cr0me1ve/marten-core
 
-go 1.25.5
-
-toolchain go1.26.5
+go 1.26.6
 
 require (
 	github.com/improbable-eng/grpc-web v0.15.0
@@ -102,7 +100,7 @@ require (
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gofrs/uuid/v5 v5.3.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
-	github.com/google/pprof v0.0.0-20240528025155-186aa0362fba // indirect
+	github.com/google/pprof v0.0.0-20240528025155-186aa0362fba
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/imkira/go-observer/v2 v2.0.0-20230629064422-8e0b61f11f1b // indirect
@@ -177,11 +175,11 @@ require (
 )
 
 // Point sing-box at the local Marten fork used by this workspace.
-replace github.com/sagernet/sing-box => github.com/Cr0me1ve/marten-sing-box v0.0.0-20260818021617-c18a7ec12ab1
+replace github.com/sagernet/sing-box => github.com/Cr0me1ve/marten-sing-box v0.0.0-20261022164405-510ac81818f6
 
 // Marten: TURNcoat dialer (DTLS over TURN). The main-module replace must be
 // present here (replaces in dep modules are ignored).
-replace github.com/cacggghp/turncoat => github.com/Cr0me1ve/TURNcoat v0.0.0-20260817163332-29ba26b97c3c
+replace github.com/cacggghp/turncoat => github.com/Cr0me1ve/TURNcoat v0.0.0-20260822152749-1a91d02c9b3c
 
 // Marten: pin bogdanfinn/tls-client to v1.10.0 — last release without
 // HTTP/3 client (no quic-go-utls dep, no qpack v0.6.0 conflict). Pin
@@ -204,3 +202,9 @@ replace github.com/wlynxg/anet => github.com/BieHDC/anet v0.0.6-0.20241226223613
 replace github.com/xtls/xray-core => github.com/hiddify/xray-core v0.0.0-20250413171226-57bd02ee2c86
 
 replace github.com/sagernet/wireguard-go => github.com/hiddify/wireguard-go v0.0.0-20250427083853-fa9271bf7486
+
+// Keep the gVisor endpoint detach fix in the native app dependency graph.
+replace github.com/sagernet/sing-tun => ./third_party/sing-tun
+
+// Release the fd reader stop descriptors after gVisor dispatchers exit.
+replace github.com/sagernet/gvisor => ./third_party/gvisor

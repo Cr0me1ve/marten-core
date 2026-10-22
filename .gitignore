@@ -10,3 +10,21 @@ data
 **/*.syso
 node_modules
 *.db
+*.json.claude/
+.claude/
+.codegraph/
+
+# Local workspace material
+/AGENTS.md
+/CLAUDE.md
+/.codex/
+/.codegraph/
+/goals.md
+/docs/known-regressions.md
+/docs/marten-agent-brief.md
+/docs/marten-chat-requirements.md
+/output/
+/artifacts/
+/diagnostics/
+/go.work
+/go.work.sum

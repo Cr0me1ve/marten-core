@@ -2,12 +2,11 @@ package hcore
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,8 +23,8 @@ import (
 const (
 	startInFlightWaitPeriod      = 30 * time.Second
 	startCleanupCloseGracePeriod = 12 * time.Second
-	startCleanupPortWaitPeriod   = 12 * time.Second
-	startCleanupPortPollPeriod   = 200 * time.Millisecond
+	startPortAdmissionWaitPeriod = 12 * time.Second
+	selectedRouteTimeoutDelay    = int32(1<<16 - 1)
 )
 
 func applyRuntimeDebugLogLevel(options *option.Options, debug bool) {
@@ -78,6 +77,53 @@ func validateAndroidRuntimeSettings(
 	return nil
 }
 
+func isUsableSelectedRoutePreflight(result *OutboundInfo) bool {
+	return result != nil &&
+		result.Tag != "" &&
+		result.UrlTestTime != nil &&
+		result.UrlTestDelay > 0 &&
+		result.UrlTestDelay < selectedRouteTimeoutDelay
+}
+
+func preflightSelectedRouteBeforeAndroidTun(
+	ctx context.Context,
+	instance *libbox.BoxService,
+) error {
+	selectedType, err := selectedOutboundTypeOnBox(instance, config.OutboundSelectTag)
+	if err != nil {
+		return fmt.Errorf("selected route is unavailable before Android TUN: %w", err)
+	}
+	if selectedType != C.TypeVLESS {
+		return nil
+	}
+	result, err := probeSelectedRouteOnBox(
+		ctx,
+		&UrlTestRequest{GroupTag: config.OutboundSelectTag},
+		instance,
+		func() bool {
+			static.lock.Lock()
+			defer static.lock.Unlock()
+			return static.Box == instance && static.CoreState == CoreStates_STARTING
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("selected route preflight failed before Android TUN: %w", err)
+	}
+	if !isUsableSelectedRoutePreflight(result) {
+		return fmt.Errorf("selected route preflight was not usable before Android TUN")
+	}
+	Log(
+		LogLevel_INFO,
+		LogType_CORE,
+		fmt.Sprintf(
+			"selected route preflight verified before Android TUN type=%s delay=%dms",
+			result.Type,
+			result.UrlTestDelay,
+		),
+	)
+	return nil
+}
+
 func logCoreStartState(options *option.Options) {
 	logCoreStartStateWithRuntimeConfig(options, loadCoreRuntimeConfigSnapshot())
 }
@@ -100,7 +146,7 @@ func logCoreStartStateWithRuntimeConfig(
 }
 
 func (s *CoreService) Start(ctx context.Context, in *StartRequest) (*CoreInfoResponse, error) {
-	return Start(in)
+	return startService(ctx, in)
 }
 
 func Start(in *StartRequest) (*CoreInfoResponse, error) {
@@ -108,7 +154,7 @@ func Start(in *StartRequest) (*CoreInfoResponse, error) {
 }
 
 func (s *CoreService) StartService(ctx context.Context, in *StartRequest) (*CoreInfoResponse, error) {
-	return StartService(in)
+	return startService(ctx, in)
 }
 
 func saveLastStartRequest(in *StartRequest) error {
@@ -158,29 +204,67 @@ func loadLastStartRequestIfNeeded(in *StartRequest) (*StartRequest, error) {
 }
 
 func StartService(in *StartRequest) (coreResponse *CoreInfoResponse, err error) {
+	return startService(context.Background(), in)
+}
+
+func startService(requestContext context.Context, in *StartRequest) (coreResponse *CoreInfoResponse, err error) {
+	if requestContext == nil {
+		requestContext = context.Background()
+	}
 	cleanupPlaintextRuntimeConfig()
 	defer cleanupPlaintextRuntimeConfig()
+	startInFlightOwned := false
+	// Register the exact-start completion barrier before the panic publisher so
+	// LIFO defer ordering keeps startDone closed until every panic side effect
+	// (status publication and exact-stop ownership) has finished. Before start
+	// admission this defer is intentionally a no-op.
+	defer func() {
+		if startInFlightOwned {
+			finishStartInFlight()
+		}
+	}()
 	defer config.DeferPanicToError("startmobile", func(recovered_err error) {
 		coreResponse, err = errorWrapper(MessageType_UNEXPECTED_ERROR, recovered_err)
 	})
-	if err := waitForInFlightStop(startInFlightWaitPeriod); err != nil {
-		return SetCoreStatus(CoreStates_STOPPING, MessageType_START_SERVICE, err.Error()), err
+	if err := waitForInFlightStopContext(requestContext, startInFlightWaitPeriod); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return currentStartRejectionResponse(err), err
+		}
+		return currentStartResponse(MessageType_START_SERVICE, err.Error()), err
 	}
-	if err := waitForPreviousStartToFinish(); err != nil {
-		return SetCoreStatus(CoreStates_STOPPED, MessageType_START_SERVICE, err.Error()), err
+	if err := waitForPreviousStartToFinishContext(requestContext); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return currentStartRejectionResponse(err), err
+		}
+		return currentStartResponse(MessageType_START_SERVICE, err.Error()), err
 	}
 	static.lock.Lock()
+	if requestErr := requestContext.Err(); requestErr != nil {
+		state := static.CoreState
+		static.lock.Unlock()
+		return &CoreInfoResponse{
+			CoreState:   state,
+			MessageType: MessageType_START_SERVICE,
+			Message:     requestErr.Error(),
+		}, requestErr
+	}
+	if static.startAdmissionClosed {
+		state := static.CoreState
+		static.lock.Unlock()
+		err := fmt.Errorf("core start admission is sealed until setup completes")
+		return startResponse(state, MessageType_START_SERVICE, err.Error()), err
+	}
 	if static.CoreState != CoreStates_STOPPED {
 		state := static.CoreState
 		static.lock.Unlock()
-		return SetCoreStatus(state, MessageType_ALREADY_STARTED, "instance already started"), nil
+		return startResponse(state, MessageType_ALREADY_STARTED, "instance already started"), nil
 	}
 	resetTurncoatRouteEvidence()
 	startCtx, cancelStart := context.WithCancel(context.Background())
 	markStartInFlightLocked(cancelStart)
-	SetCoreStatus(CoreStates_STARTING, MessageType_EMPTY, "")
+	startInFlightOwned = true
+	setCoreStatusLocked(CoreStates_STARTING, MessageType_EMPTY, "")
 	static.lock.Unlock()
-	defer finishStartInFlight()
 
 	in, err = loadLastStartRequestIfNeeded(in)
 	if err != nil {
@@ -189,8 +273,9 @@ func StartService(in *StartRequest) (coreResponse *CoreInfoResponse, err error) 
 
 	static.lock.Lock()
 	if static.CoreState != CoreStates_STARTING {
+		response := startResponse(static.CoreState, MessageType_ALREADY_STOPPED, "start cancelled")
 		static.lock.Unlock()
-		return SetCoreStatus(CoreStates_STOPPED, MessageType_ALREADY_STOPPED, "start cancelled"), nil
+		return response, nil
 	}
 	static.previousStartRequest = in
 	static.lock.Unlock()
@@ -213,6 +298,18 @@ func StartService(in *StartRequest) (coreResponse *CoreInfoResponse, err error) 
 	Log(LogLevel_DEBUG, LogType_CORE, "Main Service pre start")
 	if err := service_manager.OnMainServicePreStart(options); err != nil {
 		return errorWrapper(MessageType_ERROR_EXTENSION, err)
+	}
+	localListeners := localListenEndpoints(options)
+	if err := waitForLocalListeners(
+		startCtx,
+		localListeners,
+		"start admission",
+		startPortAdmissionWaitPeriod,
+	); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return currentStartResponse(MessageType_ALREADY_STOPPED, "start cancelled"), nil
+		}
+		return errorWrapper(MessageType_START_SERVICE, err)
 	}
 	bopts := box.Options{
 		Context:           startCtx,
@@ -246,47 +343,118 @@ func StartService(in *StartRequest) (coreResponse *CoreInfoResponse, err error) 
 	static.lock.Lock()
 	if static.CoreState != CoreStates_STARTING {
 		static.lock.Unlock()
-		if !closeStartInstance(instance, options, "cancelled start") {
-			reattachLeakedStartInstance(instance, "cancelled start cleanup incomplete")
+		if !closeStartInstance(instance, "cancelled start") {
+			reattachLeakedStartInstance(instance, localListeners, "cancelled start cleanup incomplete")
 			cleanupErr := fmt.Errorf("cancelled start cleanup did not finish")
-			return SetCoreStatus(CoreStates_STOPPING, MessageType_UNEXPECTED_ERROR, cleanupErr.Error()), cleanupErr
+			return publishStartCleanupFailure(instance, cleanupErr), cleanupErr
 		}
-		return SetCoreStatus(CoreStates_STOPPED, MessageType_ALREADY_STOPPED, "start cancelled"), nil
+		return currentStartResponse(MessageType_ALREADY_STOPPED, "start cancelled"), nil
 	}
 	static.Box = instance
+	static.activeLocalListeners = cloneLocalListenEndpoints(localListeners)
 	static.lock.Unlock()
 
-	if err := instance.Start(); err != nil {
+	var instanceStartErr error
+	if runtime.GOOS == "android" && hasTunInbound(options) {
+		preStartStartedAt := time.Now()
+		Log(LogLevel_INFO, LogType_CORE, "core start stage=pre_start outcome=begin")
+		instanceStartErr = instance.PreStart()
+		Log(LogLevel_INFO, LogType_CORE, fmt.Sprintf(
+			"core start stage=pre_start outcome=complete duration_ms=%d error=%t",
+			time.Since(preStartStartedAt).Milliseconds(), instanceStartErr != nil,
+		))
+		if instanceStartErr == nil {
+			preflightStartedAt := time.Now()
+			Log(LogLevel_INFO, LogType_CORE, "core start stage=route_preflight outcome=begin")
+			instanceStartErr = preflightSelectedRouteBeforeAndroidTun(startCtx, instance)
+			Log(LogLevel_INFO, LogType_CORE, fmt.Sprintf(
+				"core start stage=route_preflight outcome=complete duration_ms=%d error=%t",
+				time.Since(preflightStartedAt).Milliseconds(), instanceStartErr != nil,
+			))
+		}
+		if instanceStartErr == nil {
+			Log(LogLevel_INFO, LogType_CORE, "core start stage=open_inbounds outcome=begin")
+			instanceStartErr = instance.StartAfterPreStart()
+			Log(LogLevel_INFO, LogType_CORE, fmt.Sprintf(
+				"core start stage=open_inbounds outcome=complete error=%t",
+				instanceStartErr != nil,
+			))
+		}
+	} else {
+		instanceStartErr = instance.Start()
+	}
+	if instanceStartErr != nil {
 		static.lock.Lock()
 		cancelled := static.CoreState != CoreStates_STARTING || static.Box != instance
 		if static.Box == instance {
 			static.Box = nil
+			static.activeLocalListeners = nil
 		}
 		static.lock.Unlock()
-		closed := closeStartInstance(instance, options, "failed start")
+		closed := closeStartInstance(instance, "failed start")
 		if !closed {
-			reattachLeakedStartInstance(instance, "failed start cleanup incomplete")
-			cleanupErr := fmt.Errorf("failed start cleanup did not finish: %w", err)
-			return SetCoreStatus(CoreStates_STOPPING, MessageType_UNEXPECTED_ERROR, cleanupErr.Error()), cleanupErr
+			reattachLeakedStartInstance(instance, localListeners, "failed start cleanup incomplete")
+			cleanupErr := fmt.Errorf("failed start cleanup did not finish: %w", instanceStartErr)
+			return publishStartCleanupFailure(instance, cleanupErr), cleanupErr
 		}
 		if cancelled {
-			return SetCoreStatus(CoreStates_STOPPED, MessageType_ALREADY_STOPPED, "start cancelled"), nil
+			return currentStartResponse(MessageType_ALREADY_STOPPED, "start cancelled"), nil
 		}
-		return errorWrapper(MessageType_START_SERVICE, err)
+		return errorWrapper(MessageType_START_SERVICE, instanceStartErr)
 	}
 
 	static.lock.Lock()
-	if static.Box != instance {
+	if static.Box == instance && static.CoreState == CoreStates_STARTING {
+		response := setCoreStatusLocked(CoreStates_STARTED, MessageType_EMPTY, "")
 		static.lock.Unlock()
-		if !closeStartInstance(instance, options, "stale start") {
-			reattachLeakedStartInstance(instance, "stale start still owns local ports")
-			return SetCoreStatus(CoreStates_STARTED, MessageType_EMPTY, "recovered stale start"), nil
-		}
-		return SetCoreStatus(CoreStates_STOPPED, MessageType_ALREADY_STOPPED, "start cancelled"), nil
+		return response, nil
 	}
+	owned := static.Box == instance
+	if !owned {
+		static.lock.Unlock()
+		if !closeStartInstance(instance, "stale start") {
+			reattachLeakedStartInstance(instance, localListeners, "stale start cleanup incomplete")
+			cleanupErr := fmt.Errorf("stale start cleanup did not finish")
+			return publishStartCleanupFailure(instance, cleanupErr), cleanupErr
+		}
+		return currentStartResponse(MessageType_ALREADY_STOPPED, "start cancelled"), nil
+	}
+	response := setCoreStatusLocked(
+		CoreStates_STOPPING,
+		MessageType_ALREADY_STOPPED,
+		"start cancellation awaiting exact close",
+	)
 	static.lock.Unlock()
 
-	return SetCoreStatus(CoreStates_STARTED, MessageType_EMPTY, ""), nil
+	// A late CancelStart may win after Box.Start returned successfully. Keep the
+	// attached instance authoritative and STOPPING: the Stop/Mobile.Close that
+	// requested cancellation is the one exact owner of Box.Close plus the fixed
+	// listener availability barrier.
+	return response, nil
+}
+
+func currentStartRejectionResponse(err error) *CoreInfoResponse {
+	return currentStartResponse(MessageType_START_SERVICE, err.Error())
+}
+
+// Rejected or stale Start calls are observations, not lifecycle owners. Build
+// their RPC response from the current state without publishing through
+// SetCoreStatus: a concurrent exact Stop/Close may have advanced the generation
+// after the caller last inspected it, and the rejected Start must never write
+// STARTED/STOPPING/STOPPED back over that authoritative result.
+func currentStartResponse(messageType MessageType, message string) *CoreInfoResponse {
+	static.lock.Lock()
+	state := static.CoreState
+	static.lock.Unlock()
+	return startResponse(state, messageType, message)
+}
+
+func startResponse(state CoreStates, messageType MessageType, message string) *CoreInfoResponse {
+	return &CoreInfoResponse{
+		CoreState:   state,
+		MessageType: messageType,
+		Message:     message,
+	}
 }
 
 func cleanupPlaintextRuntimeConfig() {
@@ -300,6 +468,10 @@ func cleanupPlaintextRuntimeConfig() {
 }
 
 func waitForPreviousStartToFinish() error {
+	return waitForPreviousStartToFinishContext(context.Background())
+}
+
+func waitForPreviousStartToFinishContext(ctx context.Context) error {
 	deadline := time.NewTimer(startInFlightWaitPeriod)
 	defer deadline.Stop()
 
@@ -318,6 +490,8 @@ func waitForPreviousStartToFinish() error {
 		}
 		select {
 		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-deadline.C:
 			return fmt.Errorf("previous start is still finishing")
 		}
@@ -342,116 +516,80 @@ func finishStartInFlight() {
 	}
 }
 
-func closeStartInstance(instance *libbox.BoxService, options *option.Options, reason string) bool {
+// sealStartAdmissionForClose shares static.lock with StartService's in-flight
+// registration. If Start wins the lock, Close sees and cancels that exact
+// operation. If Close wins, Start cannot appear behind a completed stop.
+func sealStartAdmissionForClose() {
+	static.lock.Lock()
+	static.startAdmissionClosed = true
+	cancelStart := static.startCancel
+	if static.startInFlight || static.Box != nil {
+		setCoreStatusLocked(CoreStates_STOPPING, MessageType_EMPTY, "closing core generation")
+	}
+	static.lock.Unlock()
+	if cancelStart != nil {
+		cancelStart()
+	}
+}
+
+func openStartAdmissionAfterSetup() {
+	static.lock.Lock()
+	static.startAdmissionClosed = false
+	static.lock.Unlock()
+	Log(LogLevel_DEBUG, LogType_CORE, "core start admission opened after setup")
+}
+
+// CancelStart interrupts a native Start that is waiting for local listener
+// admission. It deliberately does not close the Box: Mobile.Close/Stop remains
+// the single authoritative cleanup owner and joins the same start afterward.
+func CancelStart() bool {
+	static.lock.Lock()
+	if !static.startInFlight ||
+		static.startCancel == nil ||
+		(static.CoreState != CoreStates_STARTING && static.CoreState != CoreStates_STOPPING) {
+		static.lock.Unlock()
+		return false
+	}
+	cancelStart := static.startCancel
+	if static.CoreState == CoreStates_STARTING {
+		setCoreStatusLocked(CoreStates_STOPPING, MessageType_EMPTY, "cancelling start")
+	}
+	static.lock.Unlock()
+	cancelStart()
+	return true
+}
+
+func closeStartInstance(instance *libbox.BoxService, reason string) bool {
 	err := closeBoxWithGrace(instance, reason, startCleanupCloseGracePeriod)
 	if err != nil {
 		Log(LogLevel_WARNING, LogType_CORE, fmt.Sprintf("core close returned error during %s: %v", reason, err))
 	}
-	portsReleased := waitForStartPortsReleased(options, reason)
-	return err == nil && portsReleased
+	return err == nil
 }
 
-func reattachLeakedStartInstance(instance *libbox.BoxService, reason string) {
+func reattachLeakedStartInstance(
+	instance *libbox.BoxService,
+	localListeners []localListenEndpoint,
+	reason string,
+) {
 	static.lock.Lock()
 	if static.Box == nil {
 		static.Box = instance
+		static.activeLocalListeners = cloneLocalListenEndpoints(localListeners)
 	}
 	static.lock.Unlock()
 	Log(LogLevel_WARNING, LogType_CORE, reason)
 }
 
-func waitForStartPortsReleased(options *option.Options, reason string) bool {
-	ports := startLocalTCPPorts(options)
-	if len(ports) == 0 {
-		return true
+// A failed cleanup may publish STOPPING only while the leaked instance is
+// still the exact Box owned by this Start. If another lifecycle owner has
+// already advanced the generation, return a pure snapshot instead of
+// overwriting its state.
+func publishStartCleanupFailure(instance *libbox.BoxService, cleanupErr error) *CoreInfoResponse {
+	static.lock.Lock()
+	defer static.lock.Unlock()
+	if static.Box == instance {
+		return setCoreStatusLocked(CoreStates_STOPPING, MessageType_UNEXPECTED_ERROR, cleanupErr.Error())
 	}
-
-	deadline := time.After(startCleanupPortWaitPeriod)
-	ticker := time.NewTicker(startCleanupPortPollPeriod)
-	defer ticker.Stop()
-
-	for {
-		busy := busyLocalTCPPorts(ports)
-		if len(busy) == 0 {
-			return true
-		}
-
-		select {
-		case <-deadline:
-			Log(
-				LogLevel_WARNING,
-				LogType_CORE,
-				fmt.Sprintf("local ports still busy after %s during %s: %v", startCleanupPortWaitPeriod, reason, busy),
-			)
-			return false
-		case <-ticker.C:
-		}
-	}
-}
-
-func startLocalTCPPorts(options *option.Options) []uint16 {
-	seen := map[uint16]struct{}{}
-	add := func(port uint16) {
-		if port == 0 {
-			return
-		}
-		seen[port] = struct{}{}
-	}
-
-	for _, inbound := range options.Inbounds {
-		switch inbound.Type {
-		case C.TypeMixed:
-			add(inbound.MixedOptions.ListenPort)
-		case C.TypeHTTP:
-			add(inbound.HTTPOptions.ListenPort)
-		case C.TypeSOCKS:
-			add(inbound.SocksOptions.ListenPort)
-		case C.TypeDirect:
-			add(inbound.DirectOptions.ListenPort)
-		}
-	}
-
-	if options.Experimental != nil && options.Experimental.ClashAPI != nil {
-		if port := portFromListenAddress(options.Experimental.ClashAPI.ExternalController); port != 0 {
-			add(port)
-		}
-	}
-
-	ports := make([]uint16, 0, len(seen))
-	for port := range seen {
-		ports = append(ports, port)
-	}
-	return ports
-}
-
-func portFromListenAddress(address string) uint16 {
-	if address == "" {
-		return 0
-	}
-	if strings.Count(address, ":") == 1 {
-		_, portString, err := net.SplitHostPort(address)
-		if err == nil {
-			port, parseErr := strconv.ParseUint(portString, 10, 16)
-			if parseErr == nil {
-				return uint16(port)
-			}
-		}
-	}
-	port, err := strconv.ParseUint(address, 10, 16)
-	if err == nil {
-		return uint16(port)
-	}
-	return 0
-}
-
-func busyLocalTCPPorts(ports []uint16) []uint16 {
-	busy := make([]uint16, 0, len(ports))
-	for _, port := range ports {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))), 80*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			busy = append(busy, port)
-		}
-	}
-	return busy
+	return coreInfoResponse(static.CoreState, MessageType_UNEXPECTED_ERROR, cleanupErr.Error())
 }

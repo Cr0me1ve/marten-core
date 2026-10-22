@@ -45,12 +45,13 @@ import (
 //
 // Full line format:
 //
-//	MARTEN_TURNCOAT_CAPTCHA url=<local-captcha-url>
+//	MARTEN_TURNCOAT_CAPTCHA url=<local-captcha-url> revision=<N>
 //
 // Where <local-captcha-url> is an http://127.0.0.1:8765/... URL that the
-// Marten app should display in an in-app WebView. The token round-trip is
-// handled by the dialer's local HTTP server — the UI just needs to host the
-// page.
+// Marten app should display in an in-app WebView. The process-local monotonic
+// revision distinguishes replacement challenges that reuse the fixed local
+// URL. The token round-trip is handled by the dialer's local HTTP server — the
+// UI just needs to host the page.
 const LogTurncoatCaptchaMarker = "MARTEN_TURNCOAT_CAPTCHA"
 
 // LogTurncoatCaptchaResolvedMarker is emitted once the captcha proxy has

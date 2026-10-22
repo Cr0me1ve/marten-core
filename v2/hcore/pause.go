@@ -10,12 +10,8 @@ func (s *CoreService) Pause(ctx context.Context, pauseReq *PauseRequest) (*hcomm
 	if pauseReq == nil {
 		return nil, nil
 	}
-	mode := (*pauseReq).Mode
-	if grpcServerForMode(mode) == nil {
-		Log(LogLevel_WARNING, LogType_CORE, "grpcServer already stoped")
-		return nil, nil
-	}
-
-	CloseGrpcServer(mode)
+	// Registry retirement is atomic and does not mutate core state. Do not
+	// hold coreLifecycle or join the stop operation from its own RPC handler.
+	requestGrpcServerStop(pauseReq.Mode, s.grpcOwner)
 	return &hcommon.Empty{}, nil
 }

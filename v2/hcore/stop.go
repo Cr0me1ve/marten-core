@@ -95,6 +95,13 @@ func (coordinator *coreStopCoordinator) runExact(
 }
 
 func (coordinator *coreStopCoordinator) wait(timeout time.Duration) error {
+	return coordinator.waitContext(context.Background(), timeout)
+}
+
+func (coordinator *coreStopCoordinator) waitContext(ctx context.Context, timeout time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	coordinator.lock.Lock()
 	operation := coordinator.operation
 	coordinator.lock.Unlock()
@@ -107,6 +114,8 @@ func (coordinator *coreStopCoordinator) wait(timeout time.Duration) error {
 	select {
 	case <-operation.done:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-timer.C:
 		return fmt.Errorf("previous stop is still finishing")
 	}
@@ -276,57 +285,103 @@ func stopOnce() (coreResponse *CoreInfoResponse, err error) {
 	// 	return errorWrapper(MessageType_INSTANCE_NOT_FOUND, fmt.Errorf("instance not found"))
 	// }
 	static.lock.Lock()
-	if static.CoreState == CoreStates_STARTING && static.startInFlight {
+	if static.startInFlight &&
+		(static.CoreState == CoreStates_STARTING || static.CoreState == CoreStates_STOPPING) {
 		cancelStart := static.startCancel
 		startDone := static.startDone
-		SetCoreStatus(CoreStates_STOPPING, MessageType_EMPTY, "cancelling start")
+		setCoreStatusLocked(CoreStates_STOPPING, MessageType_EMPTY, "cancelling start")
 		static.lock.Unlock()
 		if cancelStart != nil {
 			cancelStart()
 		}
-		if err := waitForInFlightStart(startDone, startInFlightWaitPeriod); err != nil {
-			return SetCoreStatus(CoreStates_STOPPING, MessageType_UNEXPECTED_ERROR, err.Error()), err
+		startJoinStartedAt := time.Now()
+		Log(LogLevel_INFO, LogType_CORE, "core stop stage=wait_start outcome=begin")
+		// The stop operation itself is always exact. Public Stop callers have a
+		// bounded wait in coreStopCoordinator.run, but the shared owner continues
+		// until the admitted Start and any reattached Box cleanup are joinable.
+		// Otherwise Mobile.Close could finish before a late Start creates its Box.
+		if err := waitForInFlightStartExact(startDone); err != nil {
+			Log(LogLevel_WARNING, LogType_CORE, fmt.Sprintf(
+				"core stop stage=wait_start outcome=error duration_ms=%d",
+				time.Since(startJoinStartedAt).Milliseconds(),
+			))
+			static.lock.Lock()
+			response := coreInfoResponse(static.CoreState, MessageType_UNEXPECTED_ERROR, err.Error())
+			if static.startInFlight || static.Box != nil {
+				response = setCoreStatusLocked(CoreStates_STOPPING, MessageType_UNEXPECTED_ERROR, err.Error())
+			}
+			static.lock.Unlock()
+			return response, err
 		}
+		Log(LogLevel_INFO, LogType_CORE, fmt.Sprintf(
+			"core stop stage=wait_start outcome=complete duration_ms=%d",
+			time.Since(startJoinStartedAt).Milliseconds(),
+		))
 
 		static.lock.Lock()
 		if static.Box == nil {
-			SetCoreStatus(CoreStates_STOPPED, MessageType_EMPTY, "start cancelled")
+			response := setCoreStatusLocked(CoreStates_STOPPED, MessageType_EMPTY, "start cancelled")
 			static.lock.Unlock()
-			return SetCoreStatus(CoreStates_STOPPED, MessageType_EMPTY, "start cancelled"), nil
+			return response, nil
 		}
 		// The cancelled start reattached an instance whose cleanup did not
 		// complete. Keep exact ownership below and close it synchronously.
-		SetCoreStatus(CoreStates_STOPPING, MessageType_EMPTY, "finishing cancelled start cleanup")
+		setCoreStatusLocked(CoreStates_STOPPING, MessageType_EMPTY, "finishing cancelled start cleanup")
 	}
 	if static.Box == nil {
+		response := setCoreStatusLocked(CoreStates_STOPPED, MessageType_ALREADY_STOPPED, "")
 		static.lock.Unlock()
-		return SetCoreStatus(CoreStates_STOPPED, MessageType_ALREADY_STOPPED, ""), nil
+		return response, nil
 	}
 	box := static.Box
-	SetCoreStatus(CoreStates_STOPPING, MessageType_EMPTY, "")
+	setCoreStatusLocked(CoreStates_STOPPING, MessageType_EMPTY, "")
 	static.lock.Unlock()
 
 	// The coordinator, not the public caller, owns the exact Box.Close. Public
 	// Stop calls wait only for stopCloseGracePeriod, while Mobile.Close joins
 	// this same operation until the native close action has actually returned.
+	boxCloseStartedAt := time.Now()
+	Log(LogLevel_INFO, LogType_CORE, "core stop stage=box_close outcome=begin")
 	err = closeBoxExact(box)
+	Log(LogLevel_INFO, LogType_CORE, fmt.Sprintf(
+		"core stop stage=box_close outcome=complete duration_ms=%d error=%t",
+		time.Since(boxCloseStartedAt).Milliseconds(), err != nil,
+	))
 	if err != nil {
 		// Preserve the exact instance so a later bounded cleanup or process
 		// teardown still owns every native resource, including the TUN fd.
-		return SetCoreStatus(CoreStates_STOPPING, MessageType_UNEXPECTED_ERROR, err.Error()), err
+		static.lock.Lock()
+		response := coreInfoResponse(static.CoreState, MessageType_UNEXPECTED_ERROR, err.Error())
+		if static.Box == box {
+			response = setCoreStatusLocked(CoreStates_STOPPING, MessageType_UNEXPECTED_ERROR, err.Error())
+		}
+		static.lock.Unlock()
+		return response, err
 	}
-
+	// Listener availability is a next-generation admission concern. Waiting
+	// without a deadline here can strand Mobile.Close after Box.Close has already
+	// returned (and previously after CORE STOPPED was observed) when an unrelated
+	// process owns the same port. StartService performs the bounded exact-address
+	// bind probes before constructing the replacement Box.
 	static.lock.Lock()
 	if static.Box == box {
 		static.Box = nil
+		static.activeLocalListeners = nil
+		response := setCoreStatusLocked(CoreStates_STOPPED, MessageType_EMPTY, "")
+		static.lock.Unlock()
+		return response, nil
 	}
-	SetCoreStatus(CoreStates_STOPPED, MessageType_EMPTY, "")
+	response := coreInfoResponse(static.CoreState, MessageType_EMPTY, "")
 	static.lock.Unlock()
-	return SetCoreStatus(CoreStates_STOPPED, MessageType_EMPTY, ""), nil
+	return response, nil
 }
 
 func waitForInFlightStop(timeout time.Duration) error {
 	return stopOperations.wait(timeout)
+}
+
+func waitForInFlightStopContext(ctx context.Context, timeout time.Duration) error {
+	return stopOperations.waitContext(ctx, timeout)
 }
 
 func waitForInFlightStart(done <-chan struct{}, timeout time.Duration) error {
@@ -341,6 +396,14 @@ func waitForInFlightStart(done <-chan struct{}, timeout time.Duration) error {
 	case <-timer.C:
 		return fmt.Errorf("in-flight start cleanup did not finish within %s", timeout)
 	}
+}
+
+func waitForInFlightStartExact(done <-chan struct{}) error {
+	if done == nil {
+		return fmt.Errorf("in-flight start has no completion signal")
+	}
+	<-done
+	return nil
 }
 
 func closeBoxWithGrace(box *libbox.BoxService, reason string, gracePeriod time.Duration) error {

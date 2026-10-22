@@ -1,14 +1,193 @@
 package config
 
 import (
+	"context"
+	"errors"
 	"net/netip"
 	"net/url"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	dns "github.com/sagernet/sing-dns"
 )
+
+func TestPlatformEndpointResolverDoesNotReuseProcessCacheForEmptyOrErrorResult(t *testing.T) {
+	endpoint := "authoritative-physical-resolver.example"
+	cases := []struct {
+		name     string
+		resolver PlatformEndpointResolver
+	}{
+		{
+			name: "empty",
+			resolver: func(_ context.Context, _ string) ([]netip.Addr, error) {
+				return nil, nil
+			},
+		},
+		{
+			name: "error",
+			resolver: func(_ context.Context, _ string) ([]netip.Addr, error) {
+				return nil, errors.New("physical resolver unavailable")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ipMapsMutex.Lock()
+			previous, existed := ipMaps[endpoint]
+			ipMaps[endpoint] = []string{"198.51.100.99"}
+			ipMapsMutex.Unlock()
+			t.Cleanup(func() {
+				ipMapsMutex.Lock()
+				defer ipMapsMutex.Unlock()
+				if existed {
+					ipMaps[endpoint] = previous
+				} else {
+					delete(ipMaps, endpoint)
+				}
+			})
+			SetPlatformEndpointResolver(tc.resolver)
+			t.Cleanup(func() { SetPlatformEndpointResolver(nil) })
+
+			if got := getIPs(endpoint); len(got) != 0 {
+				t.Fatalf("getIPs(%q) = %v, want no reuse of the stale process cache", endpoint, got)
+			}
+		})
+	}
+}
+
+func TestPlatformEndpointResolverCancellationBoundsStalledWorkersAndAllowsNextLookup(t *testing.T) {
+	var started atomic.Int32
+	finished := make(chan struct{}, 8)
+	SetPlatformEndpointResolver(func(ctx context.Context, _ string) ([]netip.Addr, error) {
+		started.Add(1)
+		<-ctx.Done()
+		finished <- struct{}{}
+		return nil, ctx.Err()
+	})
+	t.Cleanup(func() { SetPlatformEndpointResolver(nil) })
+
+	domains := []string{
+		"stalled-1.example.test", "stalled-2.example.test", "stalled-3.example.test", "stalled-4.example.test",
+		"stalled-5.example.test", "stalled-6.example.test", "stalled-7.example.test", "stalled-8.example.test",
+	}
+	startedAt := time.Now()
+	if got := getIPs(domains...); len(got) != 0 {
+		t.Fatalf("stalled resolver returned unexpected addresses: %v", got)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 2*time.Second {
+		t.Fatalf("stalled endpoint resolution took %s, want bounded near its 500 ms deadline", elapsed)
+	}
+	if got := started.Load(); got == 0 || int(got) > cap(endpointLookupSlots) {
+		t.Fatalf("concurrent physical lookups = %d, want 1..%d", got, cap(endpointLookupSlots))
+	}
+	for index := int32(0); index < started.Load(); index++ {
+		select {
+		case <-finished:
+		case <-time.After(time.Second):
+			t.Fatal("cancelled endpoint resolver worker did not exit")
+		}
+	}
+
+	SetPlatformEndpointResolver(func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("192.0.2.51")}, nil
+	})
+	if got := getIPs("after-stall.example.test"); len(got) != 1 || got[0] != "192.0.2.51" {
+		t.Fatalf("lookup after stalled resolvers = %v, want [192.0.2.51]", got)
+	}
+}
+
+func TestBuildConfigUsesRegisteredPlatformEndpointResolverForStaticIPsAndDirectRoutes(t *testing.T) {
+	var resolvedDomains []string
+	SetPlatformEndpointResolver(func(_ context.Context, domain string) ([]netip.Addr, error) {
+		resolvedDomains = append(resolvedDomains, domain)
+		return []netip.Addr{
+			netip.MustParseAddr("198.51.100.44"),
+			netip.MustParseAddr("2001:db8::44"),
+			netip.MustParseAddr("10.0.0.44"), // blocked bootstrap answer
+			netip.Addr{},                     // invalid, must never materialize
+		}, nil
+	})
+	t.Cleanup(func() { SetPlatformEndpointResolver(nil) })
+
+	opt := *DefaultMartenOptions()
+	endpoint := "platform-resolver.example"
+	out, err := BuildConfig(opt, option.Options{
+		Outbounds: []option.Outbound{{
+			Type: C.TypeVLESS,
+			Tag:  "platform-endpoint",
+			VLESSOptions: option.VLESSOutboundOptions{
+				ServerOptions: option.ServerOptions{Server: endpoint, ServerPort: 443},
+				UUID:          "372f66bc-d81b-5392-9ce3-3658ee631ab7",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+	if len(resolvedDomains) != 1 || resolvedDomains[0] != endpoint {
+		t.Fatalf("platform resolver domains = %v, want [%s]", resolvedDomains, endpoint)
+	}
+
+	gotStaticIPs := out.DNS.StaticIPs[endpoint]
+	wantStaticIPs := []string{"198.51.100.44", "2001:db8::44"}
+	if len(gotStaticIPs) != len(wantStaticIPs) {
+		t.Fatalf("static IPs = %v, want %v", gotStaticIPs, wantStaticIPs)
+	}
+	for index, want := range wantStaticIPs {
+		if gotStaticIPs[index] != want {
+			t.Fatalf("static IPs = %v, want %v", gotStaticIPs, wantStaticIPs)
+		}
+	}
+
+	var gotCIDRs []string
+	for _, rule := range out.Route.Rules {
+		if rule.DefaultOptions.Outbound == OutboundDirectTag && containsString(rule.DefaultOptions.Domain, endpoint) {
+			gotCIDRs = rule.DefaultOptions.IPCIDR
+			break
+		}
+	}
+	if !containsString(gotCIDRs, "198.51.100.44/32") || !containsString(gotCIDRs, "2001:db8::44/128") {
+		t.Fatalf("direct endpoint CIDRs = %v, want resolved IPv4 and IPv6 CIDRs", gotCIDRs)
+	}
+	if containsString(gotCIDRs, "10.0.0.44/32") {
+		t.Fatalf("direct endpoint CIDRs = %v, must not contain blocked answer", gotCIDRs)
+	}
+}
+
+func TestBuildConfigPlatformEndpointResolverAcceptsAnEmptyAnswerWithoutFailing(t *testing.T) {
+	SetPlatformEndpointResolver(func(_ context.Context, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{}, nil
+	})
+	t.Cleanup(func() { SetPlatformEndpointResolver(nil) })
+
+	opt := *DefaultMartenOptions()
+	endpoint := "empty-platform-resolver.example"
+	out, err := BuildConfig(opt, option.Options{
+		Outbounds: []option.Outbound{{
+			Type: C.TypeVLESS,
+			Tag:  "empty-platform-endpoint",
+			VLESSOptions: option.VLESSOutboundOptions{
+				ServerOptions: option.ServerOptions{Server: endpoint, ServerPort: 443},
+				UUID:          "372f66bc-d81b-5392-9ce3-3658ee631ab7",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("BuildConfig with an empty usable platform result returned error: %v", err)
+	}
+	if got := out.DNS.StaticIPs[endpoint]; len(got) != 0 {
+		t.Fatalf("static IPs = %v, want no answer materialized from an empty resolver result", got)
+	}
+	for _, rule := range out.Route.Rules {
+		if rule.DefaultOptions.Outbound == OutboundDirectTag && containsString(rule.DefaultOptions.Domain, endpoint) && len(rule.DefaultOptions.IPCIDR) != 0 {
+			t.Fatalf("direct endpoint CIDRs = %v, want no CIDRs from an empty resolver result", rule.DefaultOptions.IPCIDR)
+		}
+	}
+}
 
 func TestDefaultRemoteDNSUsesIPLiteralDoHWithoutResolverBootstrap(t *testing.T) {
 	opt := *DefaultMartenOptions()

@@ -3,6 +3,7 @@ package hcore
 import (
 	"context"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +113,22 @@ func requireNoCaptchaLogMessage(t *testing.T, stream *captchaLogListenerStream, 
 	}
 }
 
+func requireCaptchaRevision(t *testing.T, message *LogMessage) uint64 {
+	t.Helper()
+	for _, field := range strings.Fields(message.GetMessage()) {
+		if !strings.HasPrefix(field, "revision=") {
+			continue
+		}
+		revision, err := strconv.ParseUint(strings.TrimPrefix(field, "revision="), 10, 64)
+		if err != nil || revision == 0 {
+			t.Fatalf("invalid CAPTCHA revision in %q", message.GetMessage())
+		}
+		return revision
+	}
+	t.Fatalf("CAPTCHA message omitted revision: %q", message.GetMessage())
+	return 0
+}
+
 func resetCaptchaDeliveryForTest(t *testing.T) {
 	t.Helper()
 	resetTurncoatCaptchaDelivery()
@@ -199,6 +216,91 @@ func TestLogListenerTerminalCaptchaEventsClearPendingReplay(t *testing.T) {
 			listener, _ := startCaptchaLogListener(t)
 			requireNoCaptchaLogMessage(t, listener, LogTurncoatCaptchaMarker)
 		})
+	}
+}
+
+func TestCaptchaDeliveryUsesMonotonicRequiredRevisionsAndMatchingTerminals(t *testing.T) {
+	resetCaptchaDeliveryForTest(t)
+	cursor, _ := subscribeTurncoatCaptchaDelivery()
+
+	readOne := func(t *testing.T) *LogMessage {
+		t.Helper()
+		events, nextCursor, _ := turncoatCaptchaEventsAfter(cursor)
+		cursor = nextCursor
+		if len(events) != 1 {
+			t.Fatalf("CAPTCHA delivery emitted %d events, want 1", len(events))
+		}
+		return events[0]
+	}
+
+	publishTurncoatCaptchaRequired("http://127.0.0.1:8765/captcha?fake=resolved")
+	firstRequired := readOne(t)
+	firstRevision := requireCaptchaRevision(t, firstRequired)
+	publishTurncoatCaptchaResolved()
+	firstDone := readOne(t)
+	if !strings.Contains(firstDone.GetMessage(), LogTurncoatCaptchaResolvedMarker) {
+		t.Fatalf("terminal = %q, want DONE marker", firstDone.GetMessage())
+	}
+	if got := requireCaptchaRevision(t, firstDone); got != firstRevision {
+		t.Fatalf("DONE revision = %d, want required revision %d", got, firstRevision)
+	}
+
+	publishTurncoatCaptchaRequired("http://127.0.0.1:8765/captcha?fake=failed")
+	secondRequired := readOne(t)
+	secondRevision := requireCaptchaRevision(t, secondRequired)
+	if secondRevision <= firstRevision {
+		t.Fatalf("required revisions = %d then %d, want strictly increasing", firstRevision, secondRevision)
+	}
+	publishTurncoatCaptchaFailed()
+	secondFailed := readOne(t)
+	if !strings.Contains(secondFailed.GetMessage(), LogTurncoatCaptchaFailedMarker) {
+		t.Fatalf("terminal = %q, want FAILED marker", secondFailed.GetMessage())
+	}
+	if got := requireCaptchaRevision(t, secondFailed); got != secondRevision {
+		t.Fatalf("FAILED revision = %d, want required revision %d", got, secondRevision)
+	}
+
+	publishTurncoatCaptchaRequired("http://127.0.0.1:8765/captcha?fake=reset")
+	thirdRequired := readOne(t)
+	thirdRevision := requireCaptchaRevision(t, thirdRequired)
+	if thirdRevision <= secondRevision {
+		t.Fatalf("required revisions = %d then %d, want strictly increasing", secondRevision, thirdRevision)
+	}
+	resetTurncoatCaptchaDelivery()
+	resetFailed := readOne(t)
+	if !strings.Contains(resetFailed.GetMessage(), LogTurncoatCaptchaFailedMarker) {
+		t.Fatalf("reset terminal = %q, want FAILED marker", resetFailed.GetMessage())
+	}
+	if got := requireCaptchaRevision(t, resetFailed); got != thirdRevision {
+		t.Fatalf("reset FAILED revision = %d, want required revision %d", got, thirdRevision)
+	}
+}
+
+func TestCaptchaLifecycleDiagnosticsAreRevisionCorrelatedAndURLFree(t *testing.T) {
+	source, err := os.ReadFile("captcha_delivery.go")
+	if err != nil {
+		t.Fatalf("read CAPTCHA delivery source: %v", err)
+	}
+	text := string(source)
+	for _, field := range []string{
+		"MARTEN_CAPTCHA_LIFECYCLE",
+		"event=required",
+		"event=terminal",
+		"event=reset",
+		"event=replay",
+		"revision=",
+	} {
+		if !strings.Contains(text, field) {
+			t.Fatalf("CAPTCHA lifecycle diagnostics missing %q", field)
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.Contains(line, "MARTEN_CAPTCHA_LIFECYCLE") {
+			continue
+		}
+		if strings.Contains(strings.ToLower(line), "url") {
+			t.Fatalf("CAPTCHA lifecycle format must not include a URL: %s", line)
+		}
 	}
 }
 

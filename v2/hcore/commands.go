@@ -11,7 +11,10 @@ import (
 	hcommon "github.com/Cr0me1ve/marten-core/v2/hcommon"
 	adapter "github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/conntrack"
+	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/clashapi"
+	"github.com/sagernet/sing-box/experimental/libbox"
 	outbound "github.com/sagernet/sing-box/outbound"
 	common "github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
@@ -294,59 +297,84 @@ func ProbeSelectedRoute(ctx context.Context, in *UrlTestRequest) (*OutboundInfo,
 
 	static.lock.Lock()
 	boxService := static.Box
-	if boxService == nil || static.CoreState != CoreStates_STARTED {
-		static.lock.Unlock()
+	running := boxService != nil && static.CoreState == CoreStates_STARTED
+	static.lock.Unlock()
+	if !running {
+		return nil, E.New("core service is not running")
+	}
+	return probeSelectedRouteOnBox(ctx, in, boxService, func() bool {
+		static.lock.Lock()
+		defer static.lock.Unlock()
+		return static.Box == boxService && static.CoreState == CoreStates_STARTED
+	})
+}
+
+func probeSelectedRouteOnBox(
+	ctx context.Context,
+	in *UrlTestRequest,
+	boxService *libbox.BoxService,
+	isCurrent func() bool,
+) (*OutboundInfo, error) {
+	if in == nil {
+		return nil, E.New("selected route probe request is nil")
+	}
+	if boxService == nil || isCurrent == nil || !isCurrent() {
 		return nil, E.New("core service is not running")
 	}
 	instance := boxService.GetInstance()
 	if instance == nil {
-		static.lock.Unlock()
 		return nil, E.New("core service instance is not running")
 	}
 	router := instance.Router()
 	historyStorage := boxService.UrlTestHistory()
 	boxContext := boxService.Context()
 	if router == nil || historyStorage == nil || boxContext == nil {
-		static.lock.Unlock()
 		return nil, E.New("selected route probe is unavailable")
 	}
 
-	current, loaded := router.Outbound(in.GroupTag)
-	if !loaded {
-		static.lock.Unlock()
-		return nil, E.New("outbound group not found: ", in.GroupTag)
+	selectedOutbound, selectedTag, err := resolveSelectedOutbound(router, in.GroupTag)
+	if err != nil {
+		return nil, err
 	}
-	visited := make(map[string]bool)
-	for {
-		group, isGroup := current.(adapter.OutboundGroup)
-		if !isGroup {
-			break
+	if runtime.GOOS == "ios" || (runtime.GOOS == "android" && selectedOutbound.Type() == C.TypeVLESS) {
+		probe := probeIOSSelectedRoute
+		if runtime.GOOS == "android" {
+			probe = probeAndroidSelectedRoute
 		}
-		selectedTag := group.Now()
-		if selectedTag == "" {
-			static.lock.Unlock()
-			return nil, E.New("selected outbound is empty: ", group.Tag())
+		delay, err := probe(ctx, boxContext, func(probeCtx context.Context, url string) (uint16, error) {
+			return urltest.URLTest(probeCtx, url, selectedOutbound)
+		})
+		if err != nil {
+			return nil, err
 		}
-		if visited[selectedTag] {
-			static.lock.Unlock()
-			return nil, E.New("selected outbound cycle detected: ", selectedTag)
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		visited[selectedTag] = true
-		selected, found := router.Outbound(selectedTag)
-		if !found {
-			static.lock.Unlock()
-			return nil, E.New("selected outbound not found: ", selectedTag)
+		if !isCurrent() {
+			return nil, E.New("core service changed during selected route probe")
 		}
-		current = selected
+		currentOutbound, currentTag, err := resolveSelectedOutbound(router, in.GroupTag)
+		if err != nil || currentTag != selectedTag || currentOutbound != selectedOutbound {
+			return nil, E.New("selected route changed during connectivity probe")
+		}
+		testedAt := time.Now()
+		history := historyStorage.StoreURLTestHistory(selectedTag, &urltest.History{Time: testedAt, Delay: delay})
+		if delay < outbound.TimeoutDelay && history.IpInfo == nil {
+			go outbound.CheckIP(instance.GetLogger(), boxContext, historyStorage, router, selectedOutbound)
+		}
+		historyStorage.Observer().Emit(2)
+		return &OutboundInfo{
+			Tag: selectedTag, Type: selectedOutbound.Type(),
+			UrlTestTime: timestamppb.New(testedAt), UrlTestDelay: int32(delay),
+		}, nil
 	}
-	selectedOutbound := current
-	selectedTag := outbound.RealTag(selectedOutbound)
-	static.lock.Unlock()
 
+	operationCtx, cancel := selectedRouteOperationContext(ctx, boxContext)
+	defer cancel()
 	probeStartedAt := time.Now()
 	delay := outbound.CheckOutbound(
 		instance.GetLogger(),
-		boxContext,
+		operationCtx,
 		historyStorage,
 		router,
 		"",
@@ -357,10 +385,7 @@ func ProbeSelectedRoute(ctx context.Context, in *UrlTestRequest) (*OutboundInfo,
 		return nil, err
 	}
 
-	static.lock.Lock()
-	stillCurrent := static.Box == boxService && static.CoreState == CoreStates_STARTED
-	static.lock.Unlock()
-	if !stillCurrent {
+	if !isCurrent() {
 		return nil, E.New("core service changed during selected route probe")
 	}
 
@@ -375,6 +400,45 @@ func ProbeSelectedRoute(ctx context.Context, in *UrlTestRequest) (*OutboundInfo,
 		UrlTestTime:  timestamppb.New(history.Time),
 		UrlTestDelay: int32(delay),
 	}, nil
+}
+
+func selectedOutboundTypeOnBox(boxService *libbox.BoxService, groupTag string) (string, error) {
+	if boxService == nil || boxService.GetInstance() == nil || boxService.GetInstance().Router() == nil {
+		return "", E.New("selected route is unavailable")
+	}
+	selected, _, err := resolveSelectedOutbound(boxService.GetInstance().Router(), groupTag)
+	if err != nil {
+		return "", err
+	}
+	return selected.Type(), nil
+}
+
+func resolveSelectedOutbound(router adapter.Router, groupTag string) (adapter.Outbound, string, error) {
+	current, loaded := router.Outbound(groupTag)
+	if !loaded {
+		return nil, "", E.New("outbound group not found: ", groupTag)
+	}
+	visited := make(map[string]bool)
+	for {
+		group, isGroup := current.(adapter.OutboundGroup)
+		if !isGroup {
+			break
+		}
+		selectedTag := group.Now()
+		if selectedTag == "" {
+			return nil, "", E.New("selected outbound is empty: ", group.Tag())
+		}
+		if visited[selectedTag] {
+			return nil, "", E.New("selected outbound cycle detected: ", selectedTag)
+		}
+		visited[selectedTag] = true
+		selected, found := router.Outbound(selectedTag)
+		if !found {
+			return nil, "", E.New("selected outbound not found: ", selectedTag)
+		}
+		current = selected
+	}
+	return current, outbound.RealTag(current), nil
 }
 
 func (s *CoreService) UrlTest(ctx context.Context, in *UrlTestRequest) (*hcommon.Response, error) {

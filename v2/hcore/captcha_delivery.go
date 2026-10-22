@@ -1,6 +1,10 @@
 package hcore
 
-import "sync"
+import (
+	"fmt"
+	"log"
+	"sync"
+)
 
 // TURNcoat captcha messages are control-plane events. They must not depend on
 // the general log observer, whose deliberately lossy, size-one buffers are
@@ -13,49 +17,86 @@ import "sync"
 // for a gRPC client.
 const turncoatCaptchaDeliveryHistoryLimit = 64
 
+const turncoatCaptchaLifecycleMarker = "MARTEN_CAPTCHA_LIFECYCLE"
+
 type turncoatCaptchaDeliveryEvent struct {
 	sequence uint64
 	message  *LogMessage
 }
 
 type turncoatCaptchaDeliveryHub struct {
-	mu       sync.Mutex
-	sequence uint64
-	history  []turncoatCaptchaDeliveryEvent
-	pending  *turncoatCaptchaDeliveryEvent
-	wake     chan struct{}
+	mu                    sync.Mutex
+	sequence              uint64
+	nextChallengeRevision uint64
+	pendingRevision       uint64
+	history               []turncoatCaptchaDeliveryEvent
+	pending               *turncoatCaptchaDeliveryEvent
+	wake                  chan struct{}
 }
 
 var captchaDelivery = turncoatCaptchaDeliveryHub{wake: make(chan struct{})}
 
 func publishTurncoatCaptchaRequired(captchaURL string) {
-	publishTurncoatCaptchaEvent(
-		newLogMessage(LogLevel_WARNING, LogType_SERVICE, LogTurncoatCaptchaMarker+" url="+captchaURL),
+	captchaDelivery.mu.Lock()
+	defer captchaDelivery.mu.Unlock()
+	replacedPending := captchaDelivery.pending != nil
+	captchaDelivery.nextChallengeRevision++
+	revision := captchaDelivery.nextChallengeRevision
+	publishTurncoatCaptchaEventLocked(
+		newLogMessage(
+			LogLevel_WARNING,
+			LogType_SERVICE,
+			fmt.Sprintf("%s url=%s revision=%d", LogTurncoatCaptchaMarker, captchaURL, revision),
+		),
 		true,
+		revision,
+	)
+	log.Printf(
+		"%s event=required revision=%d sequence=%d replaced_pending=%t",
+		turncoatCaptchaLifecycleMarker,
+		revision,
+		captchaDelivery.sequence,
+		replacedPending,
 	)
 }
 
 func publishTurncoatCaptchaResolved() {
-	publishTurncoatCaptchaEvent(
-		newLogMessage(LogLevel_INFO, LogType_SERVICE, LogTurncoatCaptchaResolvedMarker),
-		false,
-	)
+	publishTurncoatCaptchaTerminal(LogLevel_INFO, LogTurncoatCaptchaResolvedMarker)
 }
 
 func publishTurncoatCaptchaFailed() {
-	publishTurncoatCaptchaEvent(
-		newLogMessage(LogLevel_WARNING, LogType_SERVICE, LogTurncoatCaptchaFailedMarker),
+	publishTurncoatCaptchaTerminal(LogLevel_WARNING, LogTurncoatCaptchaFailedMarker)
+}
+
+func publishTurncoatCaptchaTerminal(level LogLevel, marker string) {
+	captchaDelivery.mu.Lock()
+	defer captchaDelivery.mu.Unlock()
+	revision := captchaDelivery.pendingRevision
+	pendingMatched := captchaDelivery.pending != nil && revision != 0
+	outcome := "failed"
+	if marker == LogTurncoatCaptchaResolvedMarker {
+		outcome = "resolved"
+	}
+	message := marker
+	if revision != 0 {
+		message = fmt.Sprintf("%s revision=%d", marker, revision)
+	}
+	publishTurncoatCaptchaEventLocked(
+		newLogMessage(level, LogType_SERVICE, message),
 		false,
+		revision,
+	)
+	log.Printf(
+		"%s event=terminal outcome=%s revision=%d sequence=%d pending_matched=%t",
+		turncoatCaptchaLifecycleMarker,
+		outcome,
+		revision,
+		captchaDelivery.sequence,
+		pendingMatched,
 	)
 }
 
-func publishTurncoatCaptchaEvent(message *LogMessage, pending bool) {
-	captchaDelivery.mu.Lock()
-	defer captchaDelivery.mu.Unlock()
-	publishTurncoatCaptchaEventLocked(message, pending)
-}
-
-func publishTurncoatCaptchaEventLocked(message *LogMessage, pending bool) {
+func publishTurncoatCaptchaEventLocked(message *LogMessage, pending bool, challengeRevision uint64) {
 	captchaDelivery.sequence++
 	event := turncoatCaptchaDeliveryEvent{
 		sequence: captchaDelivery.sequence,
@@ -69,8 +110,10 @@ func publishTurncoatCaptchaEventLocked(message *LogMessage, pending bool) {
 	if pending {
 		pendingEvent := event
 		captchaDelivery.pending = &pendingEvent
+		captchaDelivery.pendingRevision = challengeRevision
 	} else {
 		captchaDelivery.pending = nil
+		captchaDelivery.pendingRevision = 0
 	}
 
 	close(captchaDelivery.wake)
@@ -84,11 +127,29 @@ func resetTurncoatCaptchaDelivery() {
 	captchaDelivery.mu.Lock()
 	defer captchaDelivery.mu.Unlock()
 	if captchaDelivery.pending != nil {
+		revision := captchaDelivery.pendingRevision
 		publishTurncoatCaptchaEventLocked(
-			newLogMessage(LogLevel_WARNING, LogType_SERVICE, LogTurncoatCaptchaFailedMarker),
+			newLogMessage(
+				LogLevel_WARNING,
+				LogType_SERVICE,
+				fmt.Sprintf("%s revision=%d", LogTurncoatCaptchaFailedMarker, revision),
+			),
 			false,
+			revision,
 		)
+		log.Printf(
+			"%s event=reset outcome=failed_terminal revision=%d sequence=%d pending=true",
+			turncoatCaptchaLifecycleMarker,
+			revision,
+			captchaDelivery.sequence,
+		)
+		return
 	}
+	log.Printf(
+		"%s event=reset outcome=no_pending revision=0 sequence=%d pending=false",
+		turncoatCaptchaLifecycleMarker,
+		captchaDelivery.sequence,
+	)
 }
 
 // subscribeTurncoatCaptchaDelivery starts a listener at the current tail and
@@ -101,6 +162,13 @@ func subscribeTurncoatCaptchaDelivery() (cursor uint64, pending *LogMessage) {
 	if captchaDelivery.pending != nil {
 		pending = captchaDelivery.pending.message
 	}
+	log.Printf(
+		"%s event=subscribe revision=%d sequence=%d pending=%t",
+		turncoatCaptchaLifecycleMarker,
+		captchaDelivery.pendingRevision,
+		captchaDelivery.sequence,
+		pending != nil,
+	)
 	return cursor, pending
 }
 
@@ -124,6 +192,13 @@ func turncoatCaptchaEventsAfter(cursor uint64) (events []*LogMessage, nextCursor
 		if captchaDelivery.pending != nil {
 			events = append(events, captchaDelivery.pending.message)
 		}
+		log.Printf(
+			"%s event=replay outcome=history_resync revision=%d sequence=%d pending=%t",
+			turncoatCaptchaLifecycleMarker,
+			captchaDelivery.pendingRevision,
+			captchaDelivery.sequence,
+			captchaDelivery.pending != nil,
+		)
 		return events, captchaDelivery.sequence, wake
 	}
 

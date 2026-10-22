@@ -13,13 +13,16 @@ GOBUILDLIB=CGO_ENABLED=1 go build -trimpath -tags $(TAGS) -ldflags="-w -s" -buil
 GOBUILDSRV=CGO_ENABLED=1 go build -ldflags "-s -w" -trimpath -tags $(TAGS)
 ANDROID_BOOTTIME_GOROOT ?= $(HOME)/.cache/marten/go-android-boottime/$(shell go env GOVERSION)
 CORE_REVISION ?= $(shell git rev-parse HEAD)
-SING_BOX_DIR ?= ../../marten-sing-box
-TURNCOAT_DIR ?= ../../TURNcoat
+SING_BOX_DIR ?= ../marten-sing-box
+TURNCOAT_DIR ?= ../TURNcoat
 SING_BOX_REVISION ?= $(shell git -C "$(SING_BOX_DIR)" rev-parse HEAD 2>/dev/null || echo 450cefb48900)
 TURNCOAT_REVISION ?= $(shell git -C "$(TURNCOAT_DIR)" rev-parse HEAD 2>/dev/null || echo 7716c0d0a86d)
 SOURCE_DIRTY ?= $(if $(shell git status --porcelain --untracked-files=normal),true,false)
 MOBILE_PACKAGE=github.com/Cr0me1ve/marten-core/platform/mobile
-MOBILE_LDFLAGS=-w -s -X $(MOBILE_PACKAGE).CoreRevision=$(CORE_REVISION) -X $(MOBILE_PACKAGE).SingBoxRevision=$(SING_BOX_REVISION) -X $(MOBILE_PACKAGE).TurncoatRevision=$(TURNCOAT_REVISION) -X $(MOBILE_PACKAGE).SourceDirty=$(SOURCE_DIRTY)
+# Keep DWARF and the symbol table in the prebuilt AAR. Android strips the copy
+# packaged in the APK, while Crashlytics consumes this unstripped input to
+# symbolicate native Go failures from libmarten-core.so.
+MOBILE_LDFLAGS=-X $(MOBILE_PACKAGE).CoreRevision=$(CORE_REVISION) -X $(MOBILE_PACKAGE).SingBoxRevision=$(SING_BOX_REVISION) -X $(MOBILE_PACKAGE).TurncoatRevision=$(TURNCOAT_REVISION) -X $(MOBILE_PACKAGE).SourceDirty=$(SOURCE_DIRTY)
 GOMOBILE_BIN=$(shell go env GOPATH)/bin/gomobile
 GOBIND_BIN=$(shell go env GOPATH)/bin/gobind
 
@@ -48,9 +51,19 @@ headers:
 	go build -buildmode=c-archive -o $(BINDIR)/ ./platform/desktop2
 
 ANDROID_TARGET ?= android
+# Preserve the feature set validated by the Android release acceptance.
+ANDROID_TAGS ?= with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_conntrack
 android: lib_install
 	./scripts/prepare_android_boottime_go.sh "$(ANDROID_BOOTTIME_GOROOT)"
-	GOFLAGS="-buildvcs=false" GOROOT="$(ANDROID_BOOTTIME_GOROOT)" PATH="$(ANDROID_BOOTTIME_GOROOT)/bin:$$PATH" gomobile bind -v -androidapi=21 -javapkg=app.marten.core -libname=$(PRODUCT_NAME) -tags=$(TAGS) -trimpath -target=$(ANDROID_TARGET) -ldflags="$(MOBILE_LDFLAGS)" -o $(BINDIR)/$(LIBNAME).aar github.com/sagernet/sing-box/experimental/libbox ./platform/mobile
+	MARTEN_ANDROID_CORE_DIR="$(CURDIR)" \
+	MARTEN_ANDROID_SING_BOX_DIR="$(abspath $(SING_BOX_DIR))" \
+	MARTEN_ANDROID_TURNCOAT_DIR="$(abspath $(TURNCOAT_DIR))" \
+	MARTEN_ANDROID_GOROOT="$(ANDROID_BOOTTIME_GOROOT)" \
+	MARTEN_ANDROID_TARGET="$(ANDROID_TARGET)" \
+	MARTEN_ANDROID_TAGS="$(ANDROID_TAGS)" \
+	MARTEN_ANDROID_LDFLAGS="$(MOBILE_LDFLAGS)" \
+	MARTEN_ANDROID_OUTPUT="$(CURDIR)/$(BINDIR)/$(LIBNAME).aar" \
+	./scripts/build_android_aar.sh
 
 ios-full: lib_install
 	gomobile bind -v  -target ios,iossimulator,tvos,tvossimulator,macos -libname=$(PRODUCT_NAME) -tags=$(TAGS),$(IOS_ADD_TAGS) -trimpath -ldflags="-w -s" -o $(BINDIR)/$(PRODUCT_NAME).xcframework github.com/sagernet/sing-box/experimental/libbox ./platform/mobile 

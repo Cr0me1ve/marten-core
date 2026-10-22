@@ -7,7 +7,7 @@ import (
 
 // TestParseConfigContent_StripsLeakedCredentialFields ensures the parser
 // silently discards server-side credential bookkeeping (`credential_id`,
-// `device_secret`, `credential_expires_at`) that older marten-server builds
+// `device_secret`, `credential_expires_at`) that older backend builds
 // merged into per-outbound JSON. sing-box decodes outbound options with
 // DisallowUnknownFields(), so without this strip a single legacy outbound
 // fails the whole config with `unmarshal error: outbounds[0].credential_expires_at`.

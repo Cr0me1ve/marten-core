@@ -16,7 +16,9 @@ type MartenInstance struct {
 	MartenOptions *config.MartenOptions
 	// activeConfigPath string
 	CoreLogFactory            log.Factory
-	coreInfoObserver          *observable.Observer[*CoreInfoResponse]
+	coreInfoObserver          *observable.Observer[*coreInfoEvent]
+	coreInfoRevision          uint64
+	coreInfoLatest            *coreInfoEvent
 	CoreState                 CoreStates
 	logObserver               *observable.Observer[*LogMessage]
 	systemInfoObserver        *observable.Observer[*SystemInfo]
@@ -25,9 +27,11 @@ type MartenInstance struct {
 	lock                      sync.Mutex
 	globalPlatformInterface   libbox.PlatformInterface
 	previousStartRequest      *StartRequest
+	activeLocalListeners      []localListenEndpoint
 	startInFlight             bool
 	startDone                 chan struct{}
 	startCancel               context.CancelFunc
+	startAdmissionClosed      bool
 	runtimeConfigLock         sync.RWMutex
 	settingsChangeLock        sync.Mutex
 	debug                     atomic.Bool
@@ -37,7 +41,15 @@ type MartenInstance struct {
 }
 
 var static = &MartenInstance{
-	coreInfoObserver:          NewObserver[*CoreInfoResponse](1),
+	coreInfoObserver: NewObserver[*coreInfoEvent](1),
+	coreInfoLatest: &coreInfoEvent{
+		revision: 0,
+		info: &CoreInfoResponse{
+			CoreState:   CoreStates_STOPPED,
+			MessageType: MessageType_EMPTY,
+			Message:     "",
+		},
+	},
 	CoreState:                 CoreStates_STOPPED,
 	logObserver:               NewObserver[*LogMessage](1),
 	systemInfoObserver:        NewObserver[*SystemInfo](1),

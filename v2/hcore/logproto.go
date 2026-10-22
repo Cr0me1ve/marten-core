@@ -6,7 +6,6 @@ import (
 	"time"
 
 	hcommon "github.com/Cr0me1ve/marten-core/v2/hcommon"
-	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/observable"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -17,13 +16,18 @@ func NewObserver[T any](listenerBufferSize int) *observable.Observer[T] {
 }
 
 func Log(level LogLevel, typ LogType, message ...any) {
+	record := newLogMessage(level, typ, fmt.Sprint(message...))
 	if static.debug.Load() || level != LogLevel_DEBUG {
-		log.Debug(level, typ, fmt.Sprint(message...))
-		fmt.Printf("%v %v %v\n", level, typ, fmt.Sprint(message...))
-		os.Stderr.WriteString(fmt.Sprintf("%v %v %v\n", level, typ, fmt.Sprint(message...)))
+		// Mobile setup redirects stderr to the native diagnostic file. The
+		// global sing-box logger also writes to stderr; forwarding through it
+		// and stdout duplicated every record even with no Flutter listener.
+		// Keep one timestamped native copy and reuse the same record for
+		// runtime delivery, including when the console write fails.
+		_, _ = fmt.Fprintf(os.Stderr, "%s %v %v %s\n",
+			record.Time.AsTime().Format(time.RFC3339Nano), level, typ, record.Message)
 	}
 
-	static.logObserver.Emit(newLogMessage(level, typ, fmt.Sprint(message...)))
+	static.logObserver.Emit(record)
 }
 
 func newLogMessage(level LogLevel, typ LogType, message string) *LogMessage {

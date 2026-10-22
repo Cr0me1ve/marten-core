@@ -6,10 +6,14 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	hcommon "github.com/Cr0me1ve/marten-core/v2/hcommon"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ensureSetupCallOrder parses Setup wrapper + setup implementation and validates sequencing
@@ -26,7 +30,7 @@ func TestSetupRestoresSettingsBeforeReadinessPublishing(t *testing.T) {
 		t.Fatalf("parse service.go: %v", err)
 	}
 
-	var setupWrapper, setupImpl *ast.FuncDecl
+	var setupWrapper, setupAdmission, setupImpl *ast.FuncDecl
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Name == nil {
@@ -37,6 +41,10 @@ func TestSetupRestoresSettingsBeforeReadinessPublishing(t *testing.T) {
 			if fn.Recv == nil {
 				setupWrapper = fn
 			}
+		case "setupWithAdmission":
+			if fn.Recv == nil {
+				setupAdmission = fn
+			}
 		case "setup":
 			if fn.Recv == nil {
 				setupImpl = fn
@@ -46,25 +54,18 @@ func TestSetupRestoresSettingsBeforeReadinessPublishing(t *testing.T) {
 	if setupWrapper == nil || setupWrapper.Body == nil {
 		t.Fatal("Setup function not found in service.go")
 	}
+	if setupAdmission == nil || setupAdmission.Body == nil {
+		t.Fatal("setupWithAdmission implementation function not found in service.go")
+	}
 	if setupImpl == nil || setupImpl.Body == nil {
 		t.Fatal("setup implementation function not found in service.go")
 	}
-	if !containsCallToFunction(setupWrapper.Body, "setup") {
-		t.Fatal("Setup wrapper should delegate to setup implementation")
+	if !containsCallToFunction(setupWrapper.Body, "setupWithAdmission") {
+		t.Fatal("Setup wrapper should delegate to generation-aware setup admission")
 	}
 
 	calls := map[string][]token.Pos{}
-	var existingServerReturn token.Pos
 	ast.Inspect(setupImpl.Body, func(node ast.Node) bool {
-		if ifStmt, ok := node.(*ast.IfStmt); ok && isBooleanIdent(ifStmt.Cond, "serverAlreadyStarted") {
-			ast.Inspect(ifStmt.Body, func(bodyNode ast.Node) bool {
-				if returnStmt, ok := bodyNode.(*ast.ReturnStmt); ok {
-					existingServerReturn = returnStmt.Pos()
-					return false
-				}
-				return true
-			})
-		}
 		call, ok := node.(*ast.CallExpr)
 		if !ok || call == nil || call.Fun == nil {
 			return true
@@ -104,12 +105,119 @@ func TestSetupRestoresSettingsBeforeReadinessPublishing(t *testing.T) {
 		t.Fatalf("fail-closed background guard must run before InitMartenService and StartGrpcServerByMode; guard=%v init=%v start=%v",
 			fset.Position(guardPos), fset.Position(initPos), fset.Position(startPos))
 	}
-	if existingServerReturn == token.NoPos {
-		t.Fatal("did not find already-started gRPC return")
+	setupSource := string(data)
+	alreadyStarted := strings.Index(setupSource, "if serverAlreadyStarted {")
+	readinessStart := strings.LastIndex(setupSource, "StartGrpcServerByMode(params.Listen, params.Mode)")
+	if alreadyStarted < 0 || readinessStart < alreadyStarted {
+		t.Fatal("non-OLD Setup must retain serverAlreadyStarted diagnostics and always revalidate readiness")
 	}
-	if !(guardPos < existingServerReturn && initPos < existingServerReturn) {
-		t.Fatalf("existing gRPC server must revalidate settings and initialize services before returning; guard=%v init=%v return=%v",
-			fset.Position(guardPos), fset.Position(initPos), fset.Position(existingServerReturn))
+	alreadyStartedBody := setupSource[alreadyStarted:readinessStart]
+	if strings.Contains(alreadyStartedBody, "return nil") || strings.Contains(alreadyStartedBody, "return err") {
+		t.Fatal("stale serverAlreadyStarted must not return success before atomic gRPC readiness revalidation")
+	}
+}
+
+func TestSetupAdmissionWaitsOutsideLifecycleAndRechecksOwnerAfterStopBarrier(t *testing.T) {
+	service := readHcoreSource(t, "service.go")
+	admission := sourceSection(t, service, "func setupWithAdmission", "\nfunc setup(")
+	firstSnapshot := strings.Index(admission, "grpcSetupAdmissionSnapshot(owner)")
+	stopWait := strings.Index(admission, "case <-operation.done:")
+	lifecycle := strings.Index(admission, "coreLifecycle.run(func() error {")
+	secondSnapshot := strings.Index(admission[lifecycle:], "grpcSetupAdmissionSnapshot(owner)")
+	staleReject := strings.Index(admission[lifecycle:], "gRPC setup server is stopping")
+	if firstSnapshot < 0 || stopWait < firstSnapshot || lifecycle < stopWait || secondSnapshot < 0 || staleReject < secondSnapshot {
+		t.Fatal("Setup must wait for tracked stops outside coreLifecycle, then reject a stale owner after its lifecycle recheck")
+	}
+	lifecycleBody := admission[lifecycle:]
+	if strings.Contains(lifecycleBody, "<-operation.done") {
+		t.Fatal("Setup must never wait for a gRPC Stop barrier while holding coreLifecycle")
+	}
+
+	grpc := readHcoreSource(t, "grpc_server.go")
+	start := sourceSection(t, grpc, "func StartGrpcServerByMode", "\nfunc grpcServerForMode")
+	joinModeStop := strings.Index(start, "waitForGrpcServerStop(mode)")
+	registryLock := strings.Index(start, "grpcServerMu.Lock()")
+	existing := strings.Index(start, "if server := grpcServer[mode]; server != nil")
+	if joinModeStop < 0 || registryLock < joinModeStop || existing < registryLock {
+		t.Fatal("atomic readiness must join a concurrent mode stop before inspecting or returning a server")
+	}
+	if !strings.Contains(start, "grpcServer[mode] = server") {
+		t.Fatal("successful Setup readiness must publish a concrete gRPC server in the registry")
+	}
+	if !strings.Contains(start, "RegisterCoreServer(server, &CoreService{grpcOwner: owner})") ||
+		!strings.Contains(start, "grpcServerOwn[mode] = owner") {
+		t.Fatal("each registered CoreService must carry the same owner generation that is published in the registry")
+	}
+}
+
+func TestSetupQueuedBehindCloseRejectsStaleOwnerAfterExactStopBarrier(t *testing.T) {
+	const mode = SetupMode_GRPC_NORMAL_INSECURE
+	owner := &grpcServerOwner{mode: mode}
+	operation := &grpcServerStopOperation{done: make(chan struct{})}
+
+	grpcServerMu.Lock()
+	previousServer, hadServer := grpcServer[mode]
+	previousOwner, hadOwner := grpcServerOwn[mode]
+	previousStop, hadStop := grpcServerStop[mode]
+	grpcServerOwn[mode] = owner
+	grpcServerStop[mode] = operation
+	grpcServerMu.Unlock()
+	t.Cleanup(func() {
+		grpcServerMu.Lock()
+		if hadServer {
+			grpcServer[mode] = previousServer
+		} else {
+			delete(grpcServer, mode)
+		}
+		if hadOwner {
+			grpcServerOwn[mode] = previousOwner
+		} else {
+			delete(grpcServerOwn, mode)
+		}
+		if hadStop {
+			grpcServerStop[mode] = previousStop
+		} else {
+			delete(grpcServerStop, mode)
+		}
+		grpcServerMu.Unlock()
+	})
+
+	// Keep the lifecycle occupied as a Close handler would. The admitted Setup
+	// must wait for the exact Stop barrier before it queues for this lock.
+	lifecycleEntered := make(chan struct{})
+	releaseLifecycle := make(chan struct{})
+	go func() {
+		_ = coreLifecycle.run(func() error {
+			close(lifecycleEntered)
+			<-releaseLifecycle
+			return nil
+		})
+	}()
+	select {
+	case <-lifecycleEntered:
+	case <-time.After(time.Second):
+		t.Fatal("test setup did not acquire coreLifecycle")
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- setupWithAdmission(context.Background(), &SetupRequest{Mode: mode}, nil, owner)
+	}()
+
+	// Close unpublishes the owner before its exact server Stop can finish.
+	grpcServerMu.Lock()
+	delete(grpcServerOwn, mode)
+	grpcServerMu.Unlock()
+	close(operation.done)
+	close(releaseLifecycle)
+
+	select {
+	case err := <-result:
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("Setup error code = %v, want %v (error %v)", status.Code(err), codes.Unavailable, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Setup deadlocked behind a completed exact server-stop barrier")
 	}
 }
 
